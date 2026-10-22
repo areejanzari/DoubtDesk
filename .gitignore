@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Uploaded PDFs, rendered page images, and local data
+data/
+
+# Persistent vector database
+chroma/
+.chroma/
+
+# Python virtual environment
+.venv/
