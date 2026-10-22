@@ -51,3 +51,11 @@ def store_chunks(
     )
 
 
+def delete_document_chunks(
+    collection: Collection,
+    doc_id: str,
+) -> None:
+    collection.delete(
+        where={"doc_id": doc_id}
+    )
+

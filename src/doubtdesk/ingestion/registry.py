@@ -1,0 +1,103 @@
+import sqlite3
+from pathlib import Path
+
+
+def initialize_registry(
+    db_path: Path = Path("data/documents.db"),
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                doc_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL UNIQUE,
+                page_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'processing', 'completed', 'failed'))
+            )
+            """
+        )
+
+
+def register_document(
+    doc_id: str,
+    filename: str,
+    sha256: str,
+    db_path: Path = Path("data/documents.db"),
+) -> bool:
+    with sqlite3.connect(db_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO documents
+                (doc_id, filename, sha256)
+            VALUES (?, ?, ?)
+            """,
+            (doc_id, filename, sha256),
+        )
+
+        return cursor.rowcount == 1
+
+
+
+def get_document_by_hash(
+    sha256: str,
+    db_path: Path = Path("data/documents.db"),
+) -> dict | None:
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+
+        row = connection.execute(
+            """
+            SELECT doc_id, filename, sha256, page_count, status
+            FROM documents
+            WHERE sha256 = ?
+            """,
+            (sha256,),
+        ).fetchone()
+
+        return dict(row) if row else None
+
+
+def update_document_status(
+    doc_id: str,
+    status: str,
+    page_count: int,
+    db_path: Path = Path("data/documents.db"),
+) -> None:
+    if status not in {"pending", "processing", "completed", "failed"}:
+        raise ValueError(f"Invalid document status: {status}")
+
+    if page_count < 0:
+        raise ValueError("Page count cannot be negative")
+
+    with sqlite3.connect(db_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE documents
+            SET status = ?, page_count = ?
+            WHERE doc_id = ?
+            """,
+            (status, page_count, doc_id),
+        )
+
+        if cursor.rowcount == 0:
+            raise ValueError(f"Document not found: {doc_id}")
+
+
+def is_document_cached(
+    sha256: str,
+    db_path: Path = Path("data/documents.db"),
+) -> bool:
+    document = get_document_by_hash(sha256, db_path)
+
+    if document is None:
+        return False
+
+    return (
+        document["status"] == "completed"
+        and document["page_count"] > 0
+    )
+
