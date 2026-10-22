@@ -20,3 +20,6 @@ chroma/
 
 # Python virtual environment
 .venv/
+
+# Diagnostics file
+test.py
