@@ -2,13 +2,16 @@
 name = "doubtdesk"
 version = "0.1.0"
 description = "A multimodal RAG tutor with support for STEM PDFs"
-readme = "README.md"
+
 authors = [
     { name = "areejanzari", email = "areejanzari512@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "chromadb>=1.5.9",
     "pydantic-settings>=2.16.1",
+    "pymupdf>=2.0",
+    "sentence-transformers>=6.2.0",
 ]
 
 [project.scripts]
