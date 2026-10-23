@@ -9,10 +9,14 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.9",
+    "fastapi>=0.161.1",
     "google-genai>=2.33.0",
+    "httpx>=0.28.1",
+    "langgraph>=1.2.16",
     "pydantic-settings>=2.16.1",
     "pymupdf>=2.0",
     "sentence-transformers>=6.2.0",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]

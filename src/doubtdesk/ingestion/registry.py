@@ -150,3 +150,25 @@ def get_document_names(
         doc_id: filename
         for doc_id, filename in rows
     }
+
+
+def validate_document_ids(
+    conn: sqlite3.Connection,
+    doc_ids: list[str],
+) -> None:
+    if not doc_ids:
+        return
+
+    page_counts = get_document_page_counts(conn, doc_ids)
+
+    invalid_ids = [
+        doc_id
+        for doc_id in doc_ids
+        if doc_id not in page_counts
+        or page_counts[doc_id] <= 0
+    ]
+
+    if invalid_ids:
+        raise ValueError(
+            f"Invalid or incomplete document IDs: {invalid_ids}"
+        )
