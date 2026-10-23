@@ -125,3 +125,28 @@ def get_document_page_counts(
         row[0]: row[1]
         for row in rows
     }
+
+
+def get_document_names(
+    conn: sqlite3.Connection,
+    doc_ids: list[str],
+) -> dict[str, str]:
+    if not doc_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in doc_ids)
+
+    rows = conn.execute(
+        f"""
+        SELECT doc_id, filename
+        FROM documents
+        WHERE doc_id IN ({placeholders})
+          AND status = 'completed'
+        """,
+        doc_ids,
+    ).fetchall()
+
+    return {
+        doc_id: filename
+        for doc_id, filename in rows
+    }

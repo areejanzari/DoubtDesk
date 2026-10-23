@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections import Counter
 
 def group_chunks_by_page(chunks: list[dict]) -> list[dict]:
     pages = {}
@@ -39,46 +40,51 @@ def expand_neighbor_pages(
     if max_pages <= 0:
         raise ValueError("max_pages must be positive")
 
-    expanded = []
+    selected = []
     seen = set()
 
     for page in pages:
         key = (page["doc_id"], page["page_number"])
 
         if key not in seen:
+            selected.append(page)
             seen.add(key)
-            expanded.append({
-                "doc_id": page["doc_id"],
-                "page_number": page["page_number"],
-            })
 
-        if len(expanded) >= max_pages:
-            return expanded
-        
+        if len(selected) >= max_pages:
+            return selected
+
+    neighbor_counts = Counter()
+
     for page in pages:
         doc_id = page["doc_id"]
         page_number = page["page_number"]
-        total_pages = page_counts[doc_id]
+        total_pages = page_counts.get(doc_id, 0)
 
-        start = max(1, page_number - radius)
-        end = min(total_pages, page_number + radius)
+        for offset in range(-radius, radius + 1):
+            neighbor_number = page_number + offset
+            key = (doc_id, neighbor_number)
 
-        for number in range(start, end + 1):
-            key = (doc_id, number)
+            if (
+                1 <= neighbor_number <= total_pages
+                and key not in seen
+            ):
+                neighbor_counts[key] += 1
 
-            if key in seen:
-                continue
+    ranked_neighbors = sorted(
+        neighbor_counts,
+        key=lambda key: -neighbor_counts[key],
+    )
 
-            seen.add(key)
-            expanded.append({
-                "doc_id": doc_id,
-                "page_number": number,
-            })
+    for doc_id, page_number in ranked_neighbors:
+        if len(selected) >= max_pages:
+            break
 
-            if len(expanded) >= max_pages:
-                return expanded
+        selected.append({
+            "doc_id": doc_id,
+            "page_number": page_number,
+        })
 
-    return expanded
+    return selected
 
 
 def get_page_image_paths(
