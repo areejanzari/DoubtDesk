@@ -101,3 +101,27 @@ def is_document_cached(
         and document["page_count"] > 0
     )
 
+
+def get_document_page_counts(
+    conn: sqlite3.Connection,
+    doc_ids: list[str],
+) -> dict[str, int]:
+    if not doc_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in doc_ids)
+
+    rows = conn.execute(
+        f"""
+        SELECT doc_id, page_count
+        FROM documents
+        WHERE doc_id IN ({placeholders})
+          AND status = 'completed'
+        """,
+        doc_ids,
+    ).fetchall()
+
+    return {
+        row[0]: row[1]
+        for row in rows
+    }
