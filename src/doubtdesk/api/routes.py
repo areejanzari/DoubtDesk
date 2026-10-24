@@ -1,4 +1,5 @@
 import sqlite3
+import pymupdf
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
@@ -61,15 +62,57 @@ def upload_document(file: UploadFile= File(...)):
         with TemporaryDirectory() as temp_dir:
             pdf_path = Path(temp_dir) / filename
 
+           
+            MAX_UPLOAD_SIZE = 25 * 1024 * 1024
+
+            total_size = 0
+
             with pdf_path.open("wb") as destination:
-                while chunk := file.file.read(1024 * 1024):    
-                    destination.write(chunk)                 
+                while chunk := file.file.read(1024 * 1024):
+                    total_size += len(chunk)
+
+                    if total_size > MAX_UPLOAD_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="PDF exceeds the 25 MB upload limit.",
+                        )
+
+                    destination.write(chunk)
 
             if pdf_path.stat().st_size == 0:
                 raise HTTPException(
                     status_code=400,
                     detail="Uploaded PDF is empty.",
                 )
+
+            with pdf_path.open("rb") as pdf:
+                signature = pdf.read(5)
+
+            if signature != b"%PDF-":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid PDF file content.",
+                )
+
+            try:
+                with pdf_path.open("rb") as pdf:
+                    pdf_bytes = pdf.read()
+
+                with pymupdf.open(
+                    stream=pdf_bytes,
+                    filetype="pdf",
+                ) as document:
+                    if document.page_count == 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="PDF contains no pages.",
+                        )
+
+            except (pymupdf.FileDataError, pymupdf.EmptyFileError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="PDF is corrupted or unreadable.",
+                ) from exc
 
             result = process_pdf(pdf_path)
 
