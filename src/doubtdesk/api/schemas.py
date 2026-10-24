@@ -11,3 +11,15 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[DocumentSource]
     formatted_answer: str
+
+class DocumentInfo(BaseModel):
+    doc_id: str
+    filename: str
+    page_count: int
+
+
+class UploadResponse(BaseModel):
+    doc_id: str
+    status: Literal["completed", "cached"]
+    page_count: int
+    filename: str

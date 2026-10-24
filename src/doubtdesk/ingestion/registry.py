@@ -172,3 +172,38 @@ def validate_document_ids(
         raise ValueError(
             f"Invalid or incomplete document IDs: {invalid_ids}"
         )
+
+
+def list_documents(
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    cursor = conn.execute(
+        """
+        SELECT doc_id, filename, page_count
+        FROM documents
+        WHERE status = 'completed'
+          AND page_count > 0
+        ORDER BY filename
+        """
+    )
+
+    return [
+        {
+            "doc_id": row[0],
+            "filename": row[1],
+            "page_count": row[2],
+        }
+        for row in cursor.fetchall()
+    ]
+
+
+def update_document_filename(
+    doc_id: str,
+    filename: str,
+    db_path: Path = Path("data/documents.db"),
+) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE documents SET filename = ? WHERE doc_id = ?",
+            (filename, doc_id),
+        )
