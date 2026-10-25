@@ -1,8 +1,10 @@
 import sqlite3
 import pymupdf
+from uuid import UUID
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse
 from doubtdesk.ingestion.service import process_pdf
 from doubtdesk.api.schemas import AskRequest, AskResponse,DocumentInfo, UploadResponse
 from doubtdesk.ingestion.registry import (
@@ -139,3 +141,42 @@ def upload_document(file: UploadFile= File(...)):
         file.file.close()
 
 
+@router.get("/documents/{doc_id}/pages/{page_number}/image")
+def get_page_image(doc_id: str, page_number: int):
+
+    try:
+        UUID(doc_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID.",
+        )
+
+    if page_number < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Page number must be greater than zero.",
+        )
+    
+    with sqlite3.connect("data/documents.db") as conn:
+        document_names = get_document_names(conn, [doc_id])
+
+    if doc_id not in document_names:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    image_dir = Path("data/page_images") / doc_id
+    image_path = image_dir / f"page_{page_number:03d}.png"
+
+    if not image_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Page image not found.",
+        )
+
+    return FileResponse(
+        path=image_path,
+        media_type="image/png",
+    )
