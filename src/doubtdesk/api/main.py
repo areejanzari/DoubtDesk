@@ -2,6 +2,7 @@ import os
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from doubtdesk.api.routes import router
 from doubtdesk.graph.builder import build_graph
@@ -36,6 +37,14 @@ app = FastAPI(
     title="DoubtDesk API",
     description="Multimodal PDF-based STEM tutor",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 app.include_router(router)
