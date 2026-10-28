@@ -1,12 +1,13 @@
 import sqlite3
 import pymupdf
-from uuid import UUID
+from uuid import UUID, uuid4
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from doubtdesk.ingestion.service import process_pdf
 from doubtdesk.api.schemas import AskRequest, AskResponse,DocumentInfo, UploadResponse
+from doubtdesk.memory.store import save_exchange
 from doubtdesk.ingestion.registry import (
     validate_document_ids,
     list_documents,
@@ -22,26 +23,46 @@ def health():
 
 @router.post("/ask", response_model=AskResponse)
 def ask(payload: AskRequest, request: Request):
-    conn = sqlite3.connect("data/documents.db")
+    conversation_id = payload.conversation_id or uuid4()
+    request_id = str(uuid4())
+
+    with sqlite3.connect("data/documents.db") as conn:
+        try:
+            validate_document_ids(conn, payload.doc_ids)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
 
     try:
-        validate_document_ids(conn, payload.doc_ids)
-
         result = request.app.state.graph.invoke({
             "question": payload.question,
             "doc_ids": payload.doc_ids,
+            "conversation_id": str(conversation_id),
+            "request_id": request_id,
         })
 
-        return AskResponse.model_validate(result)
+        response = AskResponse.model_validate({
+            **result,
+            "conversation_id": conversation_id,
+        })
+
+        save_exchange(
+            conversation_id=str(conversation_id),
+            question=payload.question,
+            answer=response.answer,
+            doc_ids=payload.doc_ids,
+            status=response.status,
+        )
+
+        return response
 
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         ) from exc
-
-    finally:
-        conn.close()
 
 @router.get('/documents',response_model=list[DocumentInfo])
 def get_documents():
@@ -51,7 +72,10 @@ def get_documents():
     return documents
 
 @router.post('/documents/upload',response_model=UploadResponse)
-def upload_document(file: UploadFile= File(...)):
+def upload_document(
+    request: Request,
+    file: UploadFile = File(...),
+):
     filename = Path(file.filename or "").name
 
     if not filename.lower().endswith(".pdf"):
@@ -116,7 +140,11 @@ def upload_document(file: UploadFile= File(...)):
                     detail="PDF is corrupted or unreadable.",
                 ) from exc
 
-            result = process_pdf(pdf_path)
+            result = process_pdf(
+                pdf_path,
+                embedding_model=request.app.state.embedding_model,
+                collection=request.app.state.collection,
+            )
 
             if result["status"] == "cached":
                         update_document_filename(

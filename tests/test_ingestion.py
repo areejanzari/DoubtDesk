@@ -294,3 +294,23 @@ def test_cache_valid_artifacts(tmp_path, monkeypatch):
         where={"doc_id": "doc1"},
         include=[],
     )
+
+def test_reuses_provided_embedding_model(service_mocks):
+    model = MagicMock()
+    collection = MagicMock()
+
+    with (
+        patch("doubtdesk.ingestion.service.load_embedding_model") as load_model,
+        patch("doubtdesk.ingestion.service.get_collection") as get_collection,
+        patch("doubtdesk.ingestion.service.embed_chunks") as embed,
+    ):
+        result = process_pdf(
+            Path("biology.pdf"),
+            embedding_model=model,
+            collection=collection,
+        )
+
+    assert result["status"] == "completed"
+    load_model.assert_not_called()
+    get_collection.assert_not_called()
+    embed.assert_called_once_with(["chunk1"], model)

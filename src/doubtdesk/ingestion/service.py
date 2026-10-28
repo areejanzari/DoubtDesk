@@ -22,11 +22,18 @@ from doubtdesk.retrieval.vector_store import (
 )
 
 
-def process_pdf(pdf_path: Path) -> dict:
+def process_pdf(
+    pdf_path: Path,
+    *,
+    embedding_model=None,
+    collection=None,
+) -> dict:
     initialize_registry()
 
     file_hash = calculate_sha256(pdf_path)
-    collection = get_collection()
+
+    if collection is None:
+        collection = get_collection()
 
     existing = get_document_by_hash(file_hash)
 
@@ -57,8 +64,10 @@ def process_pdf(pdf_path: Path) -> dict:
         pages = ingest_document(pdf_path, doc_id)
         chunks = chunk_document(pages)
 
-        model = load_embedding_model()
-        embeddings = embed_chunks(chunks, model)
+        if embedding_model is None:
+            embedding_model = load_embedding_model()
+
+        embeddings = embed_chunks(chunks, embedding_model)
 
         delete_document_chunks(collection, doc_id)
 
