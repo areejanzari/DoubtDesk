@@ -25,6 +25,8 @@ def client(tmp_path, monkeypatch):
         """)
 
     app.state.graph = MagicMock()
+    app.state.embedding_model = MagicMock()
+    app.state.collection = MagicMock()
 
     return TestClient(app)
 
@@ -48,7 +50,11 @@ def test_invalid_ask_request(client, payload):
 
     assert response.status_code == 422
 
-def test_ask_without_documents(client):
+def test_ask_without_documents(client, monkeypatch):
+    monkeypatch.setattr(
+    "doubtdesk.api.routes.save_exchange",
+    lambda **kwargs: None,
+    )
     app.state.graph.invoke.return_value = {
         "status": "general_knowledge",
         "answer": "Gravity attracts masses.",
@@ -67,10 +73,13 @@ def test_ask_without_documents(client):
     assert response.json()["status"] == "general_knowledge"
     assert response.json()["sources"] == []
 
-    app.state.graph.invoke.assert_called_once_with({
-        "question": "What is gravity?",
-        "doc_ids": [],
-    })
+    app.state.graph.invoke.assert_called_once()
+
+    called_state = app.state.graph.invoke.call_args.args[0]
+
+    assert called_state["question"] == "What is gravity?"
+    assert called_state["doc_ids"] == []
+    assert called_state["conversation_id"] == response.json()["conversation_id"]
 
 def test_list_documents(client):
     response = client.get("/documents")

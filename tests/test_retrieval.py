@@ -10,6 +10,7 @@ from doubtdesk.retrieval.vector_store import (
 from doubtdesk.retrieval.search import (
     search_chunks,
     format_search_results,
+    embed_queries
 )
 from doubtdesk.retrieval.pages import (
     group_chunks_by_page,
@@ -383,3 +384,52 @@ def test_get_page_image_paths_missing_file(tmp_path):
 
 def test_get_page_image_paths_empty(tmp_path):
     assert get_page_image_paths([], image_root=tmp_path) == []
+
+def test_embed_queries_uses_single_batch():
+    model = MagicMock()
+    model.encode.return_value = np.array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.5, 0.5],
+    ])
+
+    questions = ["Question 1", "Question 2", "Question 3"]
+
+    embeddings = embed_queries(questions, model)
+
+    model.encode.assert_called_once_with(
+        questions,
+        normalize_embeddings=True,
+    )
+
+    assert embeddings.shape == (3, 2)
+
+def test_batched_search_matches_individual_queries(populated_collection):
+    embeddings = np.array([
+        [1.0, 0.0, 0.0],
+        [0.9, 0.1, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+
+    batched = search_chunks(
+        populated_collection,
+        embeddings,
+        doc_ids=["doc_001", "doc_002"],
+        top_k=2,
+    )
+
+    assert len(batched["ids"]) == 3
+
+    for index, embedding in enumerate(embeddings):
+        individual = search_chunks(
+            populated_collection,
+            embedding,
+            doc_ids=["doc_001", "doc_002"],
+            top_k=2,
+        )
+
+        assert batched["ids"][index] == individual["ids"][0]
+
+    formatted = format_search_results(batched)
+
+    assert len(formatted) == 6

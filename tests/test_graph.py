@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock, patch
 import pytest
-from doubtdesk.graph.routing import route_documents, route_evidence
+from doubtdesk.graph.routing import route_documents, route_evidence, route_retrieval
 from doubtdesk.graph.nodes import (
     retrieve_node,
     evidence_node,
@@ -9,6 +9,22 @@ from doubtdesk.graph.nodes import (
     formatting_node,
 )
 from doubtdesk.graph.builder import build_graph
+from types import SimpleNamespace
+
+@pytest.fixture(autouse=True)
+def mock_paraphrasing(monkeypatch):
+    def fake_paraphrasing(**kwargs):
+        question = kwargs["question"]
+
+        return SimpleNamespace(
+            resolved_question=question,
+            questions=[question, question, question],
+        )
+
+    monkeypatch.setattr(
+        "doubtdesk.graph.nodes.resolve_and_paraphrase",
+        fake_paraphrasing,
+    )
 
 def test_route_documents_with_pdf():
     state = {"question": "What is photosynthesis?", "doc_ids": ["doc_001"]}
@@ -188,7 +204,15 @@ def test_graph_without_documents(tmp_path):
         "doubtdesk.graph.nodes.generate_general_answer",
         return_value="Gravity is a force of attraction.",
     ):
+
+        classifier = MagicMock()
+        classifier.predict.return_value = [
+            {"label": 0},
+            {"label": 0},
+            {"label": 0},
+        ]
         graph = build_graph(
+            scope_classifier=classifier,
             collection=MagicMock(),
             embedding_model=MagicMock(),
             client=MagicMock(),
@@ -226,8 +250,8 @@ def test_graph_grounded_route(tmp_path):
             "doubtdesk.graph.nodes.validate_document_ids"
         ),
         patch(
-            "doubtdesk.graph.nodes.embed_query",
-            return_value=MagicMock(),
+            "doubtdesk.graph.nodes.embed_queries",
+            return_value=[MagicMock(), MagicMock(), MagicMock()],
         ),
         patch(
             "doubtdesk.graph.nodes.search_chunks",
@@ -239,7 +263,7 @@ def test_graph_grounded_route(tmp_path):
         ),
         patch(
             "doubtdesk.graph.nodes.group_chunks_by_page",
-            return_value={},
+            return_value=[],
         ),
         patch(
             "doubtdesk.graph.nodes.get_document_page_counts",
@@ -272,7 +296,15 @@ def test_graph_grounded_route(tmp_path):
             return_value={"doc_001": "biology.pdf"},
         ),
     ):
+
+        classifier = MagicMock()
+        classifier.predict.return_value = [
+            {"label": 0},
+            {"label": 0},
+            {"label": 0},
+        ]
         graph = build_graph(
+            scope_classifier=classifier,
             collection=MagicMock(),
             embedding_model=MagicMock(),
             client=MagicMock(),
@@ -289,3 +321,18 @@ def test_graph_grounded_route(tmp_path):
     assert result["answer"] == evidence.answer
     assert result["sources"] == [source.model_dump.return_value]
     assert "biology.pdf" in result["formatted_answer"]
+
+def test_route_retrieval_with_pages():
+    state = {
+        "retrieved_pages": [
+            {"doc_id": "doc_001", "page_number": 1}
+        ]
+    }
+
+    assert route_retrieval(state) == "evidence"
+
+
+def test_route_retrieval_without_pages():
+    state = {"retrieved_pages": []}
+
+    assert route_retrieval(state) == "fallback"

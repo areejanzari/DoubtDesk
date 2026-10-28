@@ -616,3 +616,154 @@ describe('DoubtDesk citations and PDF viewer', () => {
     expect(screen.queryByText('Sources')).not.toBeInTheDocument()
   })
 })
+
+describe('DoubtDesk backend integration responses', () => {
+  it('labels out-of-scope answers without showing citations', async () => {
+    const user = userEvent.setup()
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [],
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'out_of_scope',
+          answer: 'I can help with academic questions.',
+          sources: [],
+          conversation_id: 'conversation-1',
+        }),
+      } as Response)
+
+    render(<App />)
+
+    await user.type(
+      screen.getByPlaceholderText('Ask a follow-up question…'),
+      'How do I play PUBG?'
+    )
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByText('I can help with academic questions.')).toBeInTheDocument()
+    expect(screen.getByText('Outside academic scope')).toBeInTheDocument()
+    expect(screen.queryByText('Sources')).not.toBeInTheDocument()
+  })
+
+  it('reuses the conversation ID for a follow-up question', async () => {
+    const user = userEvent.setup()
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [],
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'general_knowledge',
+          answer: 'The kidneys filter the blood.',
+          sources: [],
+          conversation_id: 'conversation-123',
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'general_knowledge',
+          answer: 'They also maintain fluid balance.',
+          sources: [],
+          conversation_id: 'conversation-123',
+        }),
+      } as Response)
+
+    render(<App />)
+
+    const input = screen.getByPlaceholderText('Ask a follow-up question…')
+    await user.type(input, 'What do kidneys do?')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('The kidneys filter the blood.')).toBeInTheDocument()
+
+    await user.type(input, 'What else do they do?')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('They also maintain fluid balance.')).toBeInTheDocument()
+
+    const askCalls = vi.mocked(fetch).mock.calls.filter(
+      ([url]) => url === 'http://localhost:8000/ask'
+    )
+
+    expect(askCalls).toHaveLength(2)
+    expect(JSON.parse(askCalls[0][1]!.body as string)).toEqual({
+      question: 'What do kidneys do?',
+      doc_ids: [],
+    })
+    expect(JSON.parse(askCalls[1][1]!.body as string)).toEqual({
+      question: 'What else do they do?',
+      doc_ids: [],
+      conversation_id: 'conversation-123',
+    })
+  })
+
+  it('shows a backend validation error in the chat', async () => {
+    const user = userEvent.setup()
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [],
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        json: async () => ({ detail: 'Selected document does not exist.' }),
+      } as Response)
+
+    render(<App />)
+
+    await user.type(
+      screen.getByPlaceholderText('Ask a follow-up question…'),
+      'Explain photosynthesis'
+    )
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByText('Selected document does not exist.')).toBeInTheDocument()
+    expect(screen.getByText('Request failed')).toBeInTheDocument()
+  })
+
+  it('handles an unexpected answer payload without rendering a fake answer', async () => {
+    const user = userEvent.setup()
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [],
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: 'general_knowledge' }),
+      } as Response)
+
+    render(<App />)
+
+    await user.type(
+      screen.getByPlaceholderText('Ask a follow-up question…'),
+      'What is DNA?'
+    )
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByText('Unexpected answer response')).toBeInTheDocument()
+    expect(screen.getByText('Request failed')).toBeInTheDocument()
+  })
+
+  it('rejects a malformed document-list response', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ documents: [] }),
+    } as Response)
+
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Unexpected document list response'
+    )
+  })
+})

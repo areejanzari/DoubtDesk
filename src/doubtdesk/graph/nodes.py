@@ -5,7 +5,7 @@ from doubtdesk.ingestion.registry import (
     validate_document_ids,
 )
 from doubtdesk.retrieval.search import (
-    embed_query,
+    embed_queries,
     search_chunks,
     format_search_results,
 )
@@ -26,8 +26,9 @@ from doubtdesk.answering.validation import (
 from doubtdesk.answering.fallback import generate_general_answer
 from doubtdesk.answering.formatting import format_answer
 from doubtdesk.ingestion.registry import get_document_names
-
-
+from doubtdesk.guardrails.paraphrasing import resolve_and_paraphrase
+from doubtdesk.memory.context import get_conversation_context
+from doubtdesk.guardrails.responses import get_off_topic_response
 
 
 def retrieve_node(collection, embedding_model, db_path):
@@ -41,28 +42,51 @@ def retrieve_node(collection, embedding_model, db_path):
         if not doc_ids:
             return {"retrieved_pages": []}
 
+        paraphrases = state.get("paraphrases") or [question]
+
         with sqlite3.connect(db_path) as conn:
             validate_document_ids(conn, doc_ids)
 
-            question_embedding = embed_query(
-                question, embedding_model
+            question_embeddings = embed_queries(
+                paraphrases,
+                embedding_model,
             )
 
             results = search_chunks(
                 collection,
-                question_embedding,
+                question_embeddings,
                 doc_ids,
             )
 
             chunks = format_search_results(results)
-            matched_pages = group_chunks_by_page(chunks)
+
+            unique_chunks = {}
+
+            for chunk in chunks:
+                chunk_id = chunk["chunk_id"]
+
+                if (
+                    chunk_id not in unique_chunks
+                    or chunk["distance"] < unique_chunks[chunk_id]["distance"]
+                ):
+                    unique_chunks[chunk_id] = chunk
+
+            ranked_chunks = sorted(
+                unique_chunks.values(),
+                key=lambda chunk: chunk["distance"],
+            )
+
+            matched_pages = group_chunks_by_page(
+                ranked_chunks
+            )
 
             page_counts = get_document_page_counts(
-                conn, doc_ids
+                conn,
+                doc_ids,
             )
 
             selected_pages = expand_neighbor_pages(
-                matched_pages,
+                matched_pages[:5],
                 page_counts,
                 radius=1,
                 max_pages=6,
@@ -85,7 +109,7 @@ def evidence_node(client, model_name):
             )
 
         content = build_vision_content(
-            question=state["question"],
+            question=state.get("resolved_question", state["question"]),
             pages=pages,
         )
 
@@ -93,6 +117,8 @@ def evidence_node(client, model_name):
             client=client,
             model_name=model_name,
             content=content,
+            request_id=state.get("request_id"),
+            conversation_id=state.get("conversation_id"),
         )
 
         validate_evidence_consistency(evidence)
@@ -109,7 +135,9 @@ def fallback_node(client, model_name):
         answer = generate_general_answer(
             client=client,
             model_name=model_name,
-            question=state["question"],
+            question=state.get("resolved_question", state["question"]),
+            request_id=state.get("request_id"),
+            conversation_id=state.get("conversation_id"),
         )
 
         return {
@@ -166,3 +194,64 @@ def formatting_node(db_path):
         return {"formatted_answer": formatted_answer}
 
     return format_response
+
+
+def paraphrase_node(client, model_name):
+    def paraphrase(state: DoubtDeskState) -> dict:
+        question = state["question"]
+        conversation_id = state.get("conversation_id")
+
+        history = []
+
+        if conversation_id:
+            history = get_conversation_context(
+                conversation_id=conversation_id,
+                question=question,
+                doc_ids=state.get("doc_ids", []),
+            )
+
+        result = resolve_and_paraphrase(
+            client=client,
+            model_name=model_name,
+            question=question,
+            history=history,
+            request_id=state.get("request_id"),
+            conversation_id=state.get("conversation_id"),
+        )
+
+        return {
+            "resolved_question": result.resolved_question,
+            "paraphrases": result.questions,
+        }
+
+    return paraphrase
+
+
+def scope_node(classifier):
+    def classify(state: DoubtDeskState) -> dict:
+        predictions = classifier.predict(
+            state["paraphrases"]
+        )
+
+        is_off_topic = all(
+            prediction["label"] == 1
+            for prediction in predictions
+        )
+
+        return {
+            "scope_predictions": predictions,
+            "is_off_topic": is_off_topic,
+        }
+
+    return classify
+
+
+def rejection_node(state: DoubtDeskState) -> dict:
+    message = get_off_topic_response()
+
+    return {
+        "status": "out_of_scope",
+        "answer": message,
+        "sources": [],
+        "formatted_answer": message,
+    }

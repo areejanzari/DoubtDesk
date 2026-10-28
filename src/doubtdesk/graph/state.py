@@ -11,3 +11,9 @@ class DoubtDeskState(TypedDict, total=False):
     answer: str
     sources: list[dict]
     formatted_answer: str
+    paraphrases: list[str]
+    scope_predictions: list[dict]
+    is_off_topic: bool
+    conversation_id: str
+    resolved_question: str
+    request_id: str 

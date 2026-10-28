@@ -13,12 +13,10 @@ import {
 import 'katex/dist/katex.min.css'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
-// Optional integration point. Example: /documents/{doc_id}/pages/{page}/image
-// Leave empty until FastAPI actually serves the stored PNG pages.
-const PAGE_IMAGE_TEMPLATE = import.meta.env.VITE_PAGE_IMAGE_URL_TEMPLATE || ''
+const PAGE_IMAGE_TEMPLATE = import.meta.env.VITE_PAGE_IMAGE_URL_TEMPLATE || '/documents/{doc_id}/pages/{page}/image'
 
 type DocumentInfo = { doc_id: string; filename: string; page_count: number }
-type AnswerStatus = 'grounded' | 'general_knowledge' | 'unknown'
+type AnswerStatus = 'grounded' | 'general_knowledge' | 'out_of_scope' | 'unknown'
 type Source = { docId?: string; filename: string; page: number; excerpt?: string }
 type Message = {
   id: number
@@ -29,10 +27,11 @@ type Message = {
   error?: boolean
 }
 type AskResponse = {
-  status?: string
-  answer?: string
-  formatted_answer?: string
-  sources?: unknown
+  status: 'grounded' | 'general_knowledge' | 'out_of_scope'
+  answer: string
+  formatted_answer: string
+  sources: unknown
+  conversation_id: string | null
 }
 
 function extractSources(raw: unknown, documents: DocumentInfo[]): Source[] {
@@ -99,6 +98,7 @@ function App() {
   const [subject, setSubject] = useState('All')
   const [question, setQuestion] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
+  const [conversationId, setConversationId] = useState<string | null>(null)
   const [isAnswering, setIsAnswering] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadMessage, setUploadMessage] = useState('')
@@ -167,16 +167,25 @@ function App() {
     try {
       const response = await fetch(`${API_BASE}/ask`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: text, doc_ids: selectedDocIds }),
+        body: JSON.stringify({
+          question: text,
+          doc_ids: selectedDocIds,
+          ...(conversationId ? { conversation_id: conversationId } : {}),
+        }),
       })
-      if (!response.ok) throw new Error(`Unable to answer (${response.status})`)
-      const data: AskResponse = await response.json()
-      const content = data.answer || data.formatted_answer || 'No answer was returned.'
-      const status: AnswerStatus = data.status === 'grounded' ? 'grounded' : data.status === 'general_knowledge' ? 'general_knowledge' : 'unknown'
+      const data: AskResponse | { detail?: unknown } | null = await response.json().catch(() => null)
+      if (!response.ok) {
+        const detail = data && 'detail' in data && typeof data.detail === 'string' ? data.detail : null
+        throw new Error(detail || `Unable to answer (${response.status})`)
+      }
+      if (!data || !('answer' in data) || typeof data.answer !== 'string') throw new Error('Unexpected answer response')
+      const answerData = data as AskResponse
+      if (answerData.conversation_id) setConversationId(answerData.conversation_id)
+      const content = answerData.answer || answerData.formatted_answer || 'No answer was returned.'
+      const status: AnswerStatus = answerData.status === 'grounded' || answerData.status === 'general_knowledge' || answerData.status === 'out_of_scope' ? answerData.status : 'unknown'
+      const parsedSources = status === 'grounded' ? extractSources(answerData.sources, documents) : []
       const sources = status === 'grounded'
-        ? extractSources(data.sources, documents).concat(
-            extractSources(data.sources, documents).length ? [] : sourcesFromAnswer(data.formatted_answer || '', documents)
-          )
+        ? (parsedSources.length ? parsedSources : sourcesFromAnswer(answerData.formatted_answer || '', documents))
         : []
       setMessages((old) => [...old, { id: nextId(), role: 'assistant', content, status, sources }])
     } catch (error) {
@@ -261,7 +270,7 @@ function App() {
             {messages.map((message) => <article key={message.id} className={message.role === 'user' ? 'flex justify-end' : 'flex items-start gap-3'}>
               {message.role === 'assistant' && <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-[#4169FF]"><GraduationCap size={17} /></div>}
               <div className={message.role === 'user' ? 'max-w-[88%] rounded-2xl rounded-tr-md bg-[#EEF2FF] px-4 py-3 text-sm leading-7 sm:max-w-[78%]' : 'min-w-0 max-w-full flex-1'}>
-                {message.role === 'assistant' && <div className="mb-2 flex flex-wrap items-center gap-2"><span className="text-sm font-semibold">DoubtDesk</span>{message.status === 'grounded' && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">From documents</span>}{message.status === 'general_knowledge' && <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">Not from document</span>}{message.error && <span className="text-xs text-red-600">Request failed</span>}</div>}
+                {message.role === 'assistant' && <div className="mb-2 flex flex-wrap items-center gap-2"><span className="text-sm font-semibold">DoubtDesk</span>{message.status === 'grounded' && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">From documents</span>}{message.status === 'general_knowledge' && <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">Not from document</span>}{message.status === 'out_of_scope' && <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">Outside academic scope</span>}{message.error && <span className="text-xs text-red-600">Request failed</span>}</div>}
                 {message.role === 'assistant' ? <MarkdownContent content={message.content} /> : <p className="whitespace-pre-wrap break-words">{message.content}</p>}
                 {message.role === 'assistant' && <div className="mt-4 space-y-2"><button className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-slate-500 hover:bg-slate-100" onClick={() => { void navigator.clipboard.writeText(message.content).then(() => { setCopiedId(message.id); window.setTimeout(() => setCopiedId(null), 1500) }).catch(() => {}) }}>{copiedId === message.id ? <Check size={14} /> : <Clipboard size={14} />}{copiedId === message.id ? 'Copied' : 'Copy answer'}</button>
                   {!!message.sources?.length && <div className="border-t border-slate-100 pt-3"><p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Sources</p><div className="flex flex-wrap gap-2">{message.sources.map((source, index) => <button key={`${source.filename}-${source.page}-${index}`} className="flex max-w-full items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:border-blue-300 hover:bg-blue-50" onClick={() => openSource(source)}><FileText size={16} className="mt-0.5 shrink-0 text-[#4169FF]" /><span className="min-w-0"><span className="block break-all text-xs font-medium">[{index + 1}] {source.filename}</span><span className="text-xs text-slate-500">Page {source.page}</span>{source.excerpt && <span className="mt-1 block line-clamp-2 text-xs text-slate-500">{source.excerpt}</span>}</span></button>)}</div></div>}
@@ -278,7 +287,7 @@ function App() {
       {viewerSource && <aside className={`${viewerFullscreen ? 'fixed inset-0 z-50 w-full' : 'fixed inset-0 z-40 w-full lg:static lg:z-auto lg:w-[380px] lg:shrink-0'} flex min-h-0 flex-col border-l border-slate-200 bg-white shadow-xl lg:shadow-none`}>
         <div className="flex items-center justify-between gap-2 border-b border-slate-200 p-4"><div className="min-w-0"><p className="truncate text-sm font-semibold">{viewerSource.filename}</p><p className="text-xs text-slate-500">Page {viewerPage}{activeViewerDoc ? ` of ${activeViewerDoc.page_count}` : ''}</p></div><div className="flex items-center"><IconButton label="Fullscreen" onClick={() => setViewerFullscreen((v) => !v)}><Maximize2 size={17} /></IconButton><IconButton label="Close viewer" onClick={() => { setViewerSource(null); setViewerFullscreen(false) }}><X size={18} /></IconButton></div></div>
         <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2"><div className="flex items-center"><IconButton label="Previous page" disabled={viewerPage <= 1} onClick={() => setViewerPage((p) => Math.max(1, p - 1))}><ChevronLeft size={18} /></IconButton><span className="px-2 text-xs text-slate-600">{viewerPage}{activeViewerDoc ? ` / ${activeViewerDoc.page_count}` : ''}</span><IconButton label="Next page" disabled={!activeViewerDoc || viewerPage >= activeViewerDoc.page_count} onClick={() => setViewerPage((p) => p + 1)}><ChevronRight size={18} /></IconButton></div><div className="flex items-center"><IconButton label="Zoom out" disabled={zoom <= 0.5} onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}><ZoomOut size={17} /></IconButton><span className="w-11 text-center text-xs text-slate-500">{Math.round(zoom * 100)}%</span><IconButton label="Zoom in" disabled={zoom >= 2.5} onClick={() => setZoom((z) => Math.min(2.5, z + 0.25))}><ZoomIn size={17} /></IconButton></div></div>
-        <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-5 text-center">{pageImageUrl ? <img src={pageImageUrl} alt={`${viewerSource.filename} page ${viewerPage}`} style={{ width: `${zoom * 100}%`, maxWidth: 'none' }} className="mx-auto bg-white shadow-lg" /> : <div className="mx-auto mt-12 max-w-xs rounded-2xl border border-slate-200 bg-white p-6 text-left shadow-sm"><FileText size={28} className="mb-3 text-[#4169FF]" /><h3 className="mb-2 text-sm font-semibold">Page preview not connected</h3><p className="text-sm leading-6 text-slate-500">This citation refers to {viewerSource.filename}, page {viewerPage}. The backend must expose its stored page PNGs before the image can be displayed. Set VITE_PAGE_IMAGE_URL_TEMPLATE to that endpoint once available.</p>{viewerSource.excerpt && <blockquote className="mt-4 border-l-2 border-blue-300 pl-3 text-xs leading-5 text-slate-600">{viewerSource.excerpt}</blockquote>}</div>}</div>
+        <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-5 text-center">{pageImageUrl ? <img src={pageImageUrl} alt={`${viewerSource.filename} page ${viewerPage}`} style={{ width: `${zoom * 100}%`, maxWidth: 'none' }} className="mx-auto bg-white shadow-lg" /> : <div className="mx-auto mt-12 max-w-xs rounded-2xl border border-slate-200 bg-white p-6 text-left shadow-sm"><FileText size={28} className="mb-3 text-[#4169FF]" /><h3 className="mb-2 text-sm font-semibold">Page image unavailable</h3><p className="text-sm leading-6 text-slate-500">Unable to locate the image for {viewerSource.filename}, page {viewerPage}.</p>{viewerSource.excerpt && <blockquote className="mt-4 border-l-2 border-blue-300 pl-3 text-xs leading-5 text-slate-600">{viewerSource.excerpt}</blockquote>}</div>}</div>
       </aside>}
     </div>
   )
