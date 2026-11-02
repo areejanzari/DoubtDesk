@@ -7,6 +7,7 @@ from doubtdesk.ingestion.registry import (
     get_document_by_hash,
     update_document_status,
     is_document_cached,
+    attach_document_to_user,
 )
 from doubtdesk.ingestion.cache import cached_artifacts_exist
 from doubtdesk.ingestion.pipeline import ingest_document
@@ -22,12 +23,17 @@ from doubtdesk.retrieval.vector_store import (
 )
 
 
+
 def process_pdf(
     pdf_path: Path,
     *,
+    user_id: str,
     embedding_model=None,
     collection=None,
 ) -> dict:
+    if not user_id:
+        raise ValueError("A user_id is required to upload a document.")
+
     initialize_registry()
 
     file_hash = calculate_sha256(pdf_path)
@@ -43,6 +49,12 @@ def process_pdf(
             existing["page_count"],
             collection,
         ):
+            attach_document_to_user(
+                user_id=user_id,
+                doc_id=existing["doc_id"],
+                filename=pdf_path.name,
+            )
+
             return {
                 "doc_id": existing["doc_id"],
                 "status": "cached",
@@ -76,12 +88,18 @@ def process_pdf(
 
         update_document_status(doc_id, "completed", len(pages))
 
-        return {
-            "doc_id": doc_id,
-            "status": "completed",
-            "page_count": len(pages),
-        }
-
     except Exception:
         update_document_status(doc_id, "failed", 0)
         raise
+
+    attach_document_to_user(
+        user_id=user_id,
+        doc_id=doc_id,
+        filename=pdf_path.name,
+    )
+
+    return {
+        "doc_id": doc_id,
+        "status": "completed",
+        "page_count": len(pages),
+    }

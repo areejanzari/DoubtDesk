@@ -4,4 +4,11 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    proxy: Object.fromEntries(
+      ['/auth', '/documents', '/ask', '/health'].map(path => [
+        path, process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:8000',
+      ]),
+    ),
+  },
 })

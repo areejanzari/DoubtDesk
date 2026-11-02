@@ -3,6 +3,7 @@ from doubtdesk.answering.schemas import EvidenceResult
 
 
 class DoubtDeskState(TypedDict, total=False):
+    user_id: str
     question: str
     doc_ids: list[str]
     retrieved_pages: list[dict]
@@ -16,4 +17,5 @@ class DoubtDeskState(TypedDict, total=False):
     is_off_topic: bool
     conversation_id: str
     resolved_question: str
-    request_id: str 
+    request_id: str
+    

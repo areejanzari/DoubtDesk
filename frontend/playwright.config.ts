@@ -21,6 +21,10 @@ export default defineConfig({
       url: 'http://127.0.0.1:8001/health',
       reuseExistingServer: false,
       timeout: 120_000,
+      env: {
+        APP_ENV: 'development',
+        AUTH_ALLOWED_ORIGINS: 'http://127.0.0.1:5173,http://localhost:5173',
+      },
     },
     {
       command: 'npm run dev -- --host 127.0.0.1 --port 5173 --strictPort',
@@ -29,7 +33,8 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 60_000,
       env: {
-        VITE_API_BASE_URL: 'http://127.0.0.1:8001',
+        VITE_API_BASE_URL: '',
+        VITE_PROXY_TARGET: 'http://127.0.0.1:8001',
         VITE_PAGE_IMAGE_URL_TEMPLATE:
             '/documents/{doc_id}/pages/{page}/image',
       },

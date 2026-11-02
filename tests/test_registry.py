@@ -1,5 +1,6 @@
 import pytest
 import sqlite3
+from contextlib import closing
 from doubtdesk.ingestion.registry import (
     initialize_registry,
     register_document,
@@ -15,6 +16,9 @@ from doubtdesk.ingestion.registry import (
     get_document_names,
     list_documents,
     update_document_filename,
+    attach_document_to_user,
+    validate_user_document_ids,
+    user_can_access_document,
 )
 
 
@@ -148,14 +152,47 @@ def test_invalid_document_ids(populated_db, doc_id):
 
 
 def test_list_documents(populated_db):
-    with sqlite3.connect(populated_db) as conn:
-        result = list_documents(conn)
+    attach_document_to_user("user_A", "doc_001", "biology.pdf", populated_db)
+    attach_document_to_user("user_A", "doc_002", "chemistry.pdf", populated_db)
+    attach_document_to_user("user_B", "doc_002", "my-chemistry.pdf", populated_db)
 
-    assert len(result) == 2
-    assert [doc["filename"] for doc in result] == [
+    with closing(sqlite3.connect(populated_db)) as conn:
+        user_a = list_documents(conn, user_id="user_A")
+        user_b = list_documents(conn, user_id="user_B")
+        nobody = list_documents(conn, user_id="user_C")
+
+    assert [doc["filename"] for doc in user_a] == [
         "biology.pdf",
         "chemistry.pdf",
     ]
+    assert [doc["filename"] for doc in user_b] == ["my-chemistry.pdf"]
+    assert nobody == []
+
+
+def test_validate_user_document_ids_enforces_every_id(populated_db):
+    attach_document_to_user("user_A", "doc_001", "biology.pdf", populated_db)
+    attach_document_to_user("user_B", "doc_002", "chemistry.pdf", populated_db)
+
+    with closing(sqlite3.connect(populated_db)) as conn:
+        validate_user_document_ids(conn, "user_A", ["doc_001"])
+        validate_user_document_ids(conn, "user_A", [])
+        with pytest.raises(ValueError, match="unavailable"):
+            validate_user_document_ids(conn, "user_A", ["doc_001", "doc_002"])
+        with pytest.raises(ValueError, match="unavailable"):
+            validate_user_document_ids(conn, "user_A", ["doc_003"])
+        with pytest.raises(ValueError, match="unavailable"):
+            validate_user_document_ids(conn, "user_A", ["missing_doc"])
+
+
+def test_page_image_document_ownership(populated_db):
+    attach_document_to_user("user_A", "doc_001", "biology.pdf", populated_db)
+
+    with closing(sqlite3.connect(populated_db)) as conn:
+        assert user_can_access_document(conn, "user_A", "doc_001", 1)
+        assert user_can_access_document(conn, "user_A", "doc_001", 8)
+        assert not user_can_access_document(conn, "user_A", "doc_001", 9)
+        assert not user_can_access_document(conn, "user_B", "doc_001", 1)
+        assert not user_can_access_document(conn, "user_A", "doc_003", 1)
 
 
 def test_update_document_filename(populated_db):
