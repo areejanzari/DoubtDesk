@@ -46,6 +46,9 @@ def service_mocks():
             "doubtdesk.ingestion.service.register_document"
         ) as register,
         patch(
+            "doubtdesk.ingestion.service.attach_document_to_user"
+        ) as attach,
+        patch(
             "doubtdesk.ingestion.service.update_document_status"
         ) as update_status,
         patch(
@@ -71,6 +74,7 @@ def service_mocks():
         yield {
             "get_document": get_document,
             "register": register,
+            "attach": attach,
             "update_status": update_status,
             "ingest": ingest,
             "delete_chunks": delete_chunks,
@@ -142,13 +146,18 @@ def test_ingest_document(sample_pdf, tmp_path, monkeypatch):
     )
 
 def test_successful_ingestion(service_mocks):
-    result = process_pdf(Path("biology.pdf"))
+    result = process_pdf(Path("biology.pdf"), user_id="user_A")
 
     assert result["status"] == "completed"
     assert result["page_count"] == 2
 
     service_mocks["register"].assert_called_once()
     service_mocks["ingest"].assert_called_once()
+    service_mocks["attach"].assert_called_once()
+    assert "user_A" in (
+        *service_mocks["attach"].call_args.args,
+        *service_mocks["attach"].call_args.kwargs.values(),
+    )
 
     service_mocks["update_status"].assert_any_call(
         result["doc_id"], "processing", 0
@@ -177,7 +186,7 @@ def test_cached_document(service_mocks):
             return_value=True,
         ),
     ):
-        result = process_pdf(Path("biology.pdf"))
+        result = process_pdf(Path("biology.pdf"), user_id="user_A")
 
     assert result == {
         "doc_id": "doc_001",
@@ -187,6 +196,11 @@ def test_cached_document(service_mocks):
 
     service_mocks["ingest"].assert_not_called()
     service_mocks["register"].assert_not_called()
+    service_mocks["attach"].assert_called_once()
+    assert "user_A" in (
+        *service_mocks["attach"].call_args.args,
+        *service_mocks["attach"].call_args.kwargs.values(),
+    )
     service_mocks["store"].assert_not_called()
 
 def test_ingestion_failure(service_mocks):
@@ -195,7 +209,7 @@ def test_ingestion_failure(service_mocks):
     )
 
     with pytest.raises(RuntimeError, match="PDF extraction failed"):
-        process_pdf(Path("biology.pdf"))
+        process_pdf(Path("biology.pdf"), user_id="user_A")
 
     doc_id = service_mocks["register"].call_args.kwargs["doc_id"]
 
@@ -204,6 +218,7 @@ def test_ingestion_failure(service_mocks):
     )
 
     service_mocks["store"].assert_not_called()
+    service_mocks["attach"].assert_not_called()
 
 
 def test_empty_chunks(service_mocks):
@@ -211,7 +226,7 @@ def test_empty_chunks(service_mocks):
         "doubtdesk.ingestion.service.chunk_document",
         return_value=[],
     ):
-        result = process_pdf(Path("biology.pdf"))
+        result = process_pdf(Path("biology.pdf"), user_id="user_A")
 
     assert result["status"] == "completed"
     service_mocks["delete_chunks"].assert_called_once()
@@ -306,6 +321,7 @@ def test_reuses_provided_embedding_model(service_mocks):
     ):
         result = process_pdf(
             Path("biology.pdf"),
+            user_id="user_A",
             embedding_model=model,
             collection=collection,
         )

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -8,11 +8,13 @@ import {
   ArrowUp, BookOpen, Bot, Check, ChevronLeft,
   ChevronRight, Clipboard, FileText, GraduationCap, LoaderCircle,
   Menu, PanelLeftClose, PanelLeftOpen, Paperclip, Plus,
-  Search, Settings, X, ZoomIn, ZoomOut, Maximize2,
+  Search, Settings, X, ZoomIn, ZoomOut, Maximize2, LogOut,
 } from 'lucide-react'
 import 'katex/dist/katex.min.css'
+import { apiRequest, authApi, jsonPost } from './auth/api'
+import type { AuthUser } from './auth/api'
+import { AuthScreen } from './auth/AuthScreen'
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
 const PAGE_IMAGE_TEMPLATE = import.meta.env.VITE_PAGE_IMAGE_URL_TEMPLATE || '/documents/{doc_id}/pages/{page}/image'
 
 type DocumentInfo = { doc_id: string; filename: string; page_count: number }
@@ -91,7 +93,11 @@ function IconButton({ label, onClick, children, disabled = false }: {
     className="icon-button">{children}</button>
 }
 
-function App() {
+function TutorApp({ user, onUnauthorized, onLogout }: {
+  user: AuthUser
+  onUnauthorized: () => void
+  onLogout: () => Promise<void>
+}) {
   const [documents, setDocuments] = useState<DocumentInfo[]>([])
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([])
   const [documentSearch, setDocumentSearch] = useState('')
@@ -110,25 +116,27 @@ function App() {
   const [zoom, setZoom] = useState(1)
   const [viewerFullscreen, setViewerFullscreen] = useState(false)
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  const [imageUrl, setImageUrl] = useState<string | null>(null)
+  const [imageError, setImageError] = useState('')
+  const [loggingOut, setLoggingOut] = useState(false)
+  const [logoutError, setLogoutError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const messageIdRef = useRef(0)
   const nextId = () => ++messageIdRef.current
 
-  async function loadDocuments() {
+  const loadDocuments = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/documents`)
-      if (!response.ok) throw new Error(`Document list failed (${response.status})`)
-      const data: unknown = await response.json()
+      const data = await apiRequest<unknown>('/documents', {}, undefined, onUnauthorized)
       if (!Array.isArray(data)) throw new Error('Unexpected document list response')
       setDocuments(data as DocumentInfo[])
       setDocumentError('')
     } catch (error) {
       setDocumentError(error instanceof Error ? error.message : 'Unable to load documents')
     }
-  }
+  }, [onUnauthorized])
 
-  useEffect(() => { void loadDocuments() }, [])
+  useEffect(() => { void loadDocuments() }, [loadDocuments])
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }) }, [messages, isAnswering])
 
   async function uploadFile(file: File) {
@@ -140,9 +148,9 @@ function App() {
     try {
       const form = new FormData()
       form.append('file', file)
-      const response = await fetch(`${API_BASE}/documents/upload`, { method: 'POST', body: form })
-      const result = await response.json()
-      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Upload failed')
+      const result = await apiRequest<{ filename: string; status: string; page_count: number }>(
+        '/documents/upload', { method: 'POST', body: form }, user.csrf_token, onUnauthorized,
+      )
       setUploadMessage(result.status === 'cached' ? `${result.filename}: cached document reused.` : `${result.filename}: uploaded (${result.page_count} pages).`)
       await loadDocuments()
     } catch (error) {
@@ -165,21 +173,12 @@ function App() {
     setMessages((old) => [...old, { id: nextId(), role: 'user', content: text }])
     setIsAnswering(true)
     try {
-      const response = await fetch(`${API_BASE}/ask`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question: text,
-          doc_ids: selectedDocIds,
-          ...(conversationId ? { conversation_id: conversationId } : {}),
-        }),
-      })
-      const data: AskResponse | { detail?: unknown } | null = await response.json().catch(() => null)
-      if (!response.ok) {
-        const detail = data && 'detail' in data && typeof data.detail === 'string' ? data.detail : null
-        throw new Error(detail || `Unable to answer (${response.status})`)
-      }
-      if (!data || !('answer' in data) || typeof data.answer !== 'string') throw new Error('Unexpected answer response')
-      const answerData = data as AskResponse
+      const answerData = await jsonPost<AskResponse>('/ask', {
+        question: text,
+        doc_ids: selectedDocIds,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
+      }, user.csrf_token, onUnauthorized)
+      if (typeof answerData.answer !== 'string') throw new Error('Unexpected answer response')
       if (answerData.conversation_id) setConversationId(answerData.conversation_id)
       const content = answerData.answer || answerData.formatted_answer || 'No answer was returned.'
       const status: AnswerStatus = answerData.status === 'grounded' || answerData.status === 'general_knowledge' || answerData.status === 'out_of_scope' ? answerData.status : 'unknown'
@@ -212,9 +211,44 @@ function App() {
 
   const activeViewerDoc = viewerSource && documents.find((d) =>
     (viewerSource.docId && d.doc_id === viewerSource.docId) || d.filename === viewerSource.filename)
-  const pageImageUrl = viewerSource && activeViewerDoc && PAGE_IMAGE_TEMPLATE
-    ? `${API_BASE}${PAGE_IMAGE_TEMPLATE.replace('{doc_id}', encodeURIComponent(activeViewerDoc.doc_id)).replace('{page}', String(viewerPage))}`
+  const pageImagePath = viewerSource && activeViewerDoc && PAGE_IMAGE_TEMPLATE
+    ? PAGE_IMAGE_TEMPLATE.replace('{doc_id}', encodeURIComponent(activeViewerDoc.doc_id)).replace('{page}', String(viewerPage))
     : null
+
+  useEffect(() => {
+    setImageUrl(null)
+    setImageError('')
+    if (!pageImagePath) return
+    const controller = new AbortController()
+    let objectUrl: string | null = null
+    void apiRequest<Blob>(pageImagePath, { signal: controller.signal }, undefined, onUnauthorized)
+      .then((blob) => {
+        if (controller.signal.aborted) return
+        if (!(blob instanceof Blob)) throw new Error('Invalid PDF page image')
+        objectUrl = URL.createObjectURL(blob)
+        setImageUrl(objectUrl)
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setImageError(error instanceof Error ? error.message : 'Image unavailable')
+      })
+    return () => {
+      controller.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [pageImagePath, onUnauthorized])
+
+  async function signOut() {
+    if (loggingOut) return
+    setLoggingOut(true)
+    setLogoutError('')
+    try {
+      await onLogout()
+    } catch (error) {
+      setLogoutError(error instanceof Error ? error.message : 'Unable to sign out')
+    } finally {
+      setLoggingOut(false)
+    }
+  }
   const visibleDocs = documents.filter((doc) => {
     const matchesSearch = doc.filename.toLowerCase().includes(documentSearch.toLowerCase())
     // Filename-based subjects are only a UI filter; backend has no subject metadata.
@@ -262,8 +296,9 @@ function App() {
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-[#4169FF]"><Bot size={20} /></div>
             <div className="min-w-0"><h1 className="text-base font-semibold sm:text-lg">AI Tutor</h1><p className="hidden truncate text-xs text-slate-500 sm:block">Ask questions about your uploaded documents.</p></div>
           </div>
-          <div className="flex items-center gap-2"><span className="hidden rounded-full bg-slate-100 px-3 py-1.5 text-xs text-slate-600 sm:inline-flex">{selectedDocIds.length ? `${selectedDocIds.length} PDF${selectedDocIds.length === 1 ? '' : 's'} selected` : 'General knowledge'}</span>{viewerSource && <IconButton label="Close source viewer" onClick={() => setViewerSource(null)}><X size={18} /></IconButton>}</div>
+          <div className="flex items-center gap-2"><span className="hidden max-w-32 truncate text-sm text-slate-600 md:inline" title={user.email}>{user.username}</span><button type="button" className="icon-button" title="Sign out" aria-label="Sign out" onClick={() => void signOut()} disabled={loggingOut}>{loggingOut ? <LoaderCircle size={18} className="animate-spin" /> : <LogOut size={18} />}</button><span className="hidden rounded-full bg-slate-100 px-3 py-1.5 text-xs text-slate-600 sm:inline-flex">{selectedDocIds.length ? `${selectedDocIds.length} PDF${selectedDocIds.length === 1 ? '' : 's'} selected` : 'General knowledge'}</span>{viewerSource && <IconButton label="Close source viewer" onClick={() => setViewerSource(null)}><X size={18} /></IconButton>}</div>
         </header>
+        {logoutError && <div role="alert" className="bg-red-50 px-5 py-2 text-sm text-red-700">{logoutError}</div>}
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-7 sm:px-7" aria-live="polite">
           <div className="mx-auto w-full max-w-4xl space-y-7">
             {messages.length === 0 && <div className="flex flex-col items-center justify-center px-3 py-16 text-center sm:py-24"><div className="mb-5 rounded-2xl bg-blue-50 p-5 text-[#4169FF]"><GraduationCap size={35} /></div><h2 className="text-2xl font-semibold tracking-tight">What would you like to learn?</h2><p className="mt-3 max-w-md text-sm leading-6 text-slate-500">Select one or more PDFs to ask document-grounded questions, or ask anything without selecting a document.</p></div>}
@@ -287,10 +322,49 @@ function App() {
       {viewerSource && <aside className={`${viewerFullscreen ? 'fixed inset-0 z-50 w-full' : 'fixed inset-0 z-40 w-full lg:static lg:z-auto lg:w-[380px] lg:shrink-0'} flex min-h-0 flex-col border-l border-slate-200 bg-white shadow-xl lg:shadow-none`}>
         <div className="flex items-center justify-between gap-2 border-b border-slate-200 p-4"><div className="min-w-0"><p className="truncate text-sm font-semibold">{viewerSource.filename}</p><p className="text-xs text-slate-500">Page {viewerPage}{activeViewerDoc ? ` of ${activeViewerDoc.page_count}` : ''}</p></div><div className="flex items-center"><IconButton label="Fullscreen" onClick={() => setViewerFullscreen((v) => !v)}><Maximize2 size={17} /></IconButton><IconButton label="Close viewer" onClick={() => { setViewerSource(null); setViewerFullscreen(false) }}><X size={18} /></IconButton></div></div>
         <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2"><div className="flex items-center"><IconButton label="Previous page" disabled={viewerPage <= 1} onClick={() => setViewerPage((p) => Math.max(1, p - 1))}><ChevronLeft size={18} /></IconButton><span className="px-2 text-xs text-slate-600">{viewerPage}{activeViewerDoc ? ` / ${activeViewerDoc.page_count}` : ''}</span><IconButton label="Next page" disabled={!activeViewerDoc || viewerPage >= activeViewerDoc.page_count} onClick={() => setViewerPage((p) => p + 1)}><ChevronRight size={18} /></IconButton></div><div className="flex items-center"><IconButton label="Zoom out" disabled={zoom <= 0.5} onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))}><ZoomOut size={17} /></IconButton><span className="w-11 text-center text-xs text-slate-500">{Math.round(zoom * 100)}%</span><IconButton label="Zoom in" disabled={zoom >= 2.5} onClick={() => setZoom((z) => Math.min(2.5, z + 0.25))}><ZoomIn size={17} /></IconButton></div></div>
-        <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-5 text-center">{pageImageUrl ? <img src={pageImageUrl} alt={`${viewerSource.filename} page ${viewerPage}`} style={{ width: `${zoom * 100}%`, maxWidth: 'none' }} className="mx-auto bg-white shadow-lg" /> : <div className="mx-auto mt-12 max-w-xs rounded-2xl border border-slate-200 bg-white p-6 text-left shadow-sm"><FileText size={28} className="mb-3 text-[#4169FF]" /><h3 className="mb-2 text-sm font-semibold">Page image unavailable</h3><p className="text-sm leading-6 text-slate-500">Unable to locate the image for {viewerSource.filename}, page {viewerPage}.</p>{viewerSource.excerpt && <blockquote className="mt-4 border-l-2 border-blue-300 pl-3 text-xs leading-5 text-slate-600">{viewerSource.excerpt}</blockquote>}</div>}</div>
+        <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-5 text-center">{imageUrl ? <img src={imageUrl} alt={`${viewerSource.filename} page ${viewerPage}`} style={{ width: `${zoom * 100}%`, maxWidth: 'none' }} className="mx-auto bg-white shadow-lg" /> : <div className="mx-auto mt-12 max-w-xs rounded-2xl border border-slate-200 bg-white p-6 text-left shadow-sm"><FileText size={28} className="mb-3 text-[#4169FF]" /><h3 className="mb-2 text-sm font-semibold">Page image unavailable</h3><p className="text-sm leading-6 text-slate-500">{imageError || (pageImagePath ? "Loading page image…" : `Unable to locate the image for ${viewerSource.filename}, page ${viewerPage}.`)}</p>{viewerSource.excerpt && <blockquote className="mt-4 border-l-2 border-blue-300 pl-3 text-xs leading-5 text-slate-600">{viewerSource.excerpt}</blockquote>}</div>}</div>
       </aside>}
     </div>
   )
+}
+
+function App() {
+  const [user, setUser] = useState<AuthUser | null>(null)
+  const [checkingSession, setCheckingSession] = useState(true)
+
+  const onUnauthorized = useCallback(() => setUser(null), [])
+  useEffect(() => {
+    if (/\/(verify-email|reset-password)\/?$/.test(window.location.pathname)) {
+      setCheckingSession(false)
+      return
+    }
+    let active = true
+    void authApi.me()
+      .then((profile) => { if (active) setUser(profile) })
+      .catch(() => { if (active) setUser(null) })
+      .finally(() => { if (active) setCheckingSession(false) })
+    return () => { active = false }
+  }, [])
+
+  async function logout() {
+    if (!user) return
+    try {
+      await authApi.logout(user.csrf_token)
+      setUser(null)
+    } catch (error) {
+      if (error instanceof Error && 'status' in error && error.status === 401) {
+        setUser(null)
+        return
+      }
+      throw error
+    }
+  }
+
+  if (checkingSession) {
+    return <div role="status" className="flex min-h-dvh items-center justify-center gap-3 bg-[#F8FAFC] text-sm text-slate-500"><LoaderCircle size={20} className="animate-spin text-[#4169FF]"/> Checking session…</div>
+  }
+  if (!user) return <AuthScreen onLogin={setUser} />
+  return <TutorApp key={user.user_id} user={user} onUnauthorized={onUnauthorized} onLogout={logout} />
 }
 
 export default App

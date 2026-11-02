@@ -1,18 +1,21 @@
 import sqlite3
 import pymupdf
+from contextlib import closing
 from uuid import UUID, uuid4
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Depends
 from fastapi.responses import FileResponse
 from doubtdesk.ingestion.service import process_pdf
+from doubtdesk.auth.dependencies import require_current_user
 from doubtdesk.api.schemas import AskRequest, AskResponse,DocumentInfo, UploadResponse
-from doubtdesk.memory.store import save_exchange
+from doubtdesk.memory.store import save_exchange,claim_or_check_conversation
 from doubtdesk.ingestion.registry import (
-    validate_document_ids,
+    validate_user_document_ids,
     list_documents,
     get_document_names,
-    update_document_filename,)
+    user_can_access_document,
+)
 
 router = APIRouter()
 
@@ -21,22 +24,44 @@ def health():
     return { "status": "ok"}
 
 
+
 @router.post("/ask", response_model=AskResponse)
-def ask(payload: AskRequest, request: Request):
+def ask(
+    payload: AskRequest,
+    request: Request,
+    user: dict = Depends(require_current_user),
+):
+    user_id = user["user_id"]
     conversation_id = payload.conversation_id or uuid4()
     request_id = str(uuid4())
 
-    with sqlite3.connect("data/documents.db") as conn:
+    with closing(sqlite3.connect("data/documents.db")) as conn:
         try:
-            validate_document_ids(conn, payload.doc_ids)
+            validate_user_document_ids(
+                conn,
+                user_id=user_id,
+                doc_ids=payload.doc_ids,
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=str(exc),
             ) from exc
 
+    allowed = claim_or_check_conversation(
+        conversation_id=str(conversation_id),
+        user_id=user_id,
+    )
+
+    if not allowed:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
     try:
         result = request.app.state.graph.invoke({
+            "user_id": user_id,
             "question": payload.question,
             "doc_ids": payload.doc_ids,
             "conversation_id": str(conversation_id),
@@ -64,17 +89,27 @@ def ask(payload: AskRequest, request: Request):
             detail=str(exc),
         ) from exc
 
-@router.get('/documents',response_model=list[DocumentInfo])
-def get_documents():
-    with sqlite3.connect("data/documents.db") as conn:
-        documents = list_documents(conn)
+
+
+@router.get("/documents", response_model=list[DocumentInfo])
+def get_documents(
+    user: dict = Depends(require_current_user),
+):
+    with closing(sqlite3.connect("data/documents.db")) as conn:
+        documents = list_documents(
+            conn,
+            user_id=user["user_id"],
+        )
 
     return documents
 
-@router.post('/documents/upload',response_model=UploadResponse)
+
+
+@router.post("/documents/upload", response_model=UploadResponse)
 def upload_document(
     request: Request,
     file: UploadFile = File(...),
+    user: dict = Depends(require_current_user),
 ):
     filename = Path(file.filename or "").name
 
@@ -88,9 +123,7 @@ def upload_document(
         with TemporaryDirectory() as temp_dir:
             pdf_path = Path(temp_dir) / filename
 
-           
             MAX_UPLOAD_SIZE = 25 * 1024 * 1024
-
             total_size = 0
 
             with pdf_path.open("wb") as destination:
@@ -142,36 +175,26 @@ def upload_document(
 
             result = process_pdf(
                 pdf_path,
+                user_id=user["user_id"],
                 embedding_model=request.app.state.embedding_model,
                 collection=request.app.state.collection,
             )
 
-            if result["status"] == "cached":
-                        update_document_filename(
-                            doc_id=result["doc_id"],
-                            filename=filename,
-                        )
-
-        
-            with sqlite3.connect("data/documents.db") as conn:
-                document_names = get_document_names(
-                    conn,
-                    [result["doc_id"]],
-                )
-
             return UploadResponse(
                 **result,
-                filename=document_names[result["doc_id"]],
+                filename=filename,
             )
-
 
     finally:
         file.file.close()
 
 
 @router.get("/documents/{doc_id}/pages/{page_number}/image")
-def get_page_image(doc_id: str, page_number: int):
-
+def get_page_image(
+    doc_id: str,
+    page_number: int,
+    user: dict = Depends(require_current_user),
+):
     try:
         UUID(doc_id)
     except ValueError:
@@ -185,14 +208,19 @@ def get_page_image(doc_id: str, page_number: int):
             status_code=400,
             detail="Page number must be greater than zero.",
         )
-    
-    with sqlite3.connect("data/documents.db") as conn:
-        document_names = get_document_names(conn, [doc_id])
 
-    if doc_id not in document_names:
+    with closing(sqlite3.connect("data/documents.db")) as conn:
+        allowed = user_can_access_document(
+            conn,
+            user_id=user["user_id"],
+            doc_id=doc_id,
+            page_number=page_number,
+        )
+
+    if not allowed:
         raise HTTPException(
             status_code=404,
-            detail="Document not found.",
+            detail="Document or page not found.",
         )
 
     image_dir = Path("data/page_images") / doc_id

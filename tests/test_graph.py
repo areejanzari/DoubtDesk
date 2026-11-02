@@ -223,6 +223,7 @@ def test_graph_without_documents(tmp_path):
         result = graph.invoke({
             "question": "What is gravity?",
             "doc_ids": [],
+            "user_id": "user_A",
         })
 
     assert result["status"] == "general_knowledge"
@@ -247,8 +248,8 @@ def test_graph_grounded_route(tmp_path):
 
     with (
         patch(
-            "doubtdesk.graph.nodes.validate_document_ids"
-        ),
+            "doubtdesk.graph.nodes.validate_user_document_ids"
+        ) as mock_validate_owner,
         patch(
             "doubtdesk.graph.nodes.embed_queries",
             return_value=[MagicMock(), MagicMock(), MagicMock()],
@@ -315,8 +316,14 @@ def test_graph_grounded_route(tmp_path):
         result = graph.invoke({
             "question": "What is photosynthesis?",
             "doc_ids": ["doc_001"],
+            "user_id": "user_A",
         })
 
+    mock_validate_owner.assert_called_once()
+    assert mock_validate_owner.call_args.kwargs == {
+        "user_id": "user_A",
+        "doc_ids": ["doc_001"],
+    }
     assert result["status"] == "grounded"
     assert result["answer"] == evidence.answer
     assert result["sources"] == [source.model_dump.return_value]

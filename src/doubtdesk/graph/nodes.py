@@ -1,8 +1,10 @@
 import sqlite3
+from contextlib import closing
 from doubtdesk.graph.state import DoubtDeskState
 from doubtdesk.ingestion.registry import (
+    get_document_names,
     get_document_page_counts,
-    validate_document_ids,
+    validate_user_document_ids,
 )
 from doubtdesk.retrieval.search import (
     embed_queries,
@@ -25,10 +27,10 @@ from doubtdesk.answering.validation import (
 )
 from doubtdesk.answering.fallback import generate_general_answer
 from doubtdesk.answering.formatting import format_answer
-from doubtdesk.ingestion.registry import get_document_names
 from doubtdesk.guardrails.paraphrasing import resolve_and_paraphrase
-from doubtdesk.memory.context import get_conversation_context
+from doubtdesk.memory.context import get_user_conversation_context
 from doubtdesk.guardrails.responses import get_off_topic_response
+
 
 
 def retrieve_node(collection, embedding_model, db_path):
@@ -42,10 +44,15 @@ def retrieve_node(collection, embedding_model, db_path):
         if not doc_ids:
             return {"retrieved_pages": []}
 
+        user_id = state["user_id"]
         paraphrases = state.get("paraphrases") or [question]
 
-        with sqlite3.connect(db_path) as conn:
-            validate_document_ids(conn, doc_ids)
+        with closing(sqlite3.connect(db_path)) as conn:
+            validate_user_document_ids(
+                conn,
+                user_id=user_id,
+                doc_ids=doc_ids,
+            )
 
             question_embeddings = embed_queries(
                 paraphrases,
@@ -97,6 +104,7 @@ def retrieve_node(collection, embedding_model, db_path):
         return {"retrieved_pages": pages}
 
     return retrieve
+
 
 
 def evidence_node(client, model_name):
@@ -196,16 +204,19 @@ def formatting_node(db_path):
     return format_response
 
 
+
 def paraphrase_node(client, model_name):
     def paraphrase(state: DoubtDeskState) -> dict:
         question = state["question"]
         conversation_id = state.get("conversation_id")
+        user_id = state["user_id"]
 
         history = []
 
         if conversation_id:
-            history = get_conversation_context(
+            history = get_user_conversation_context(
                 conversation_id=conversation_id,
+                user_id=user_id,
                 question=question,
                 doc_ids=state.get("doc_ids", []),
             )
@@ -216,7 +227,7 @@ def paraphrase_node(client, model_name):
             question=question,
             history=history,
             request_id=state.get("request_id"),
-            conversation_id=state.get("conversation_id"),
+            conversation_id=conversation_id,
         )
 
         return {
@@ -225,6 +236,7 @@ def paraphrase_node(client, model_name):
         }
 
     return paraphrase
+
 
 
 def scope_node(classifier):
