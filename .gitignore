@@ -39,4 +39,4 @@ __pycache__/
 frontend/coverage/
 frontend/test-results/
 frontend/playwright-report/
-backend_dump.txt
+/test_pdfs
