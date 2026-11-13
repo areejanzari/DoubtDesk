@@ -1,90 +1,42 @@
-from google import genai
-from google.genai import types
-from time import perf_counter
-from doubtdesk.analytics.tracker import record_gemini_usage, record_gemini_failure
+from doubtdesk.observability.tracing import observe_llm_response
+
+
+GENERAL_INSTRUCTIONS = (
+    "You are DoubtDesk, an academic tutor. Answer accurately and clearly using general knowledge "
+    "in 300 output tokens or fewer. Preserve essential formulas and examples. "
+    "Do not claim to cite an uploaded PDF or fabricate PDF page references."
+)
+
+
+def general_input(question: str, feedback: str | None = None) -> list[dict]:
+    instruction = GENERAL_INSTRUCTIONS
+    if feedback:
+        instruction += " Revise your previous answer using this reviewer feedback: " + feedback[:1200]
+    return [
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": question},
+    ]
+
 
 def generate_general_answer(
-    client: genai.Client,
+    client,
     model_name: str,
     question: str,
     *,
     request_id: str | None = None,
     conversation_id: str | None = None,
+    feedback: str | None = None,
 ) -> str:
     if not question.strip():
         raise ValueError("Question cannot be empty")
-
-    start = perf_counter()
-
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=question,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are DoubtDesk, a STEM tutor. "
-                    "Answer the student's question accurately and "
-                    "clearly using general knowledge. "
-                    "Keep your answer within approximately 300 words. "
-                    "Be concise but provide enough explanation for students "
-                    "to understand the underlying concepts. "
-                    "Preserve essential formulas, equations, and examples. "
-                    "Do not claim that the answer comes from "
-                    "an uploaded document. "
-                    "Do not invent document citations."
-                ),
-                temperature=0,
-                max_output_tokens=1024,
-            ),
-        )
-
-    except Exception as exc:
-        latency_ms = round((perf_counter() - start) * 1000)
-
-        if request_id is not None:
-            record_gemini_failure(
-                request_id=request_id,
-                conversation_id=conversation_id,
-                operation="general_answer",
-                model=model_name,
-                latency_ms=latency_ms,
-                error_type=type(exc).__name__,
-            )
-
-        raise
-
-    latency_ms = round((perf_counter() - start) * 1000)
-
-    try:
-        answer = response.text
-
-        if not answer:
-            raise RuntimeError(
-                "The AI model could not generate an answer."
-            )
-
-    except (RuntimeError, ValueError) as exc:
-        if request_id is not None:
-            record_gemini_failure(
-                request_id=request_id,
-                conversation_id=conversation_id,
-                operation="general_answer",
-                model=model_name,
-                latency_ms=latency_ms,
-                error_type=type(exc).__name__,
-                response=response,
-            )
-
-        raise
-
-    if request_id is not None:
-        record_gemini_usage(
-            response=response,
-            request_id=request_id,
-            conversation_id=conversation_id,
-            operation="general_answer",
-            model=model_name,
-            latency_ms=latency_ms,
-        )
-
+    response = client.responses.create(
+        model=model_name,
+        input=general_input(question, feedback),
+        reasoning={"effort": "none"},
+        max_output_tokens=300,
+    )
+    observe_llm_response("general_answer", response, model_name, request_id, conversation_id)
+    answer = response.output_text
+    if not answer:
+        raise RuntimeError("Model returned no answer")
     return answer

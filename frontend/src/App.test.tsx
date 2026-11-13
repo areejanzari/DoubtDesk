@@ -1,3 +1,4 @@
+import { streamResponse } from './test/mockStream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -30,7 +31,8 @@ beforeEach(() => {
     const url = String(input)
     if (url.endsWith('/auth/me')) return response(ACCOUNT)
     if (url.endsWith('/documents')) return response(documents)
-    if (url.endsWith('/ask')) return response(askResult)
+    if (url.endsWith('/conversations')) return response([])
+    if (url.endsWith('/ask/stream')) return streamResponse(askResult as Record<string, unknown>)
     if (url.endsWith('/documents/upload')) return response({ status: 'completed', filename: 'sample.pdf', page_count: 2, doc_id: 'pdf_202' })
     if (url.endsWith('/auth/logout')) return response({ message: 'Logged out successfully.' })
     return response({ detail: 'Unknown route' }, 404)
@@ -86,7 +88,7 @@ expect(fetch).toHaveBeenCalledWith(
     await user.type(screen.getByPlaceholderText('Ask a follow-up question…'), 'Explain biology')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     expect(await screen.findByText('Water is H2O.')).toBeInTheDocument()
-    const askCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith('/ask'))!
+    const askCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith('/ask/stream'))!
     const opts = askCall[1]!
     expect(opts.credentials).toBe('include')
     expect(new Headers(opts.headers).get('X-CSRF-Token')).toBe('csrf_A')
@@ -102,8 +104,8 @@ expect(fetch).toHaveBeenCalledWith(
     await screen.findByText('Water is H2O.')
     await user.type(field, 'Follow up')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
-    await waitFor(() => expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/ask'))).toHaveLength(2))
-    const calls = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/ask'))
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/ask/stream'))).toHaveLength(2))
+    const calls = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/ask/stream'))
     expect(JSON.parse(String(calls[1][1]!.body)).conversation_id).toBe(askResult && (askResult as { conversation_id: string }).conversation_id)
   })
 
@@ -140,7 +142,7 @@ expect(fetch).toHaveBeenCalledWith(
   it('returns to sign-in when a protected request gets 401', async () => {
     const user = userEvent.setup()
     await openTutor()
-    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/ask')
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/ask/stream')
       ? response({ detail: 'Invalid or expired session.' }, 401)
       : response([]))
     await user.type(screen.getByPlaceholderText('Ask a follow-up question…'), 'Is the session active?')
@@ -151,7 +153,7 @@ expect(fetch).toHaveBeenCalledWith(
   it('shows backend validation errors in chat', async () => {
     const user = userEvent.setup()
     await openTutor()
-    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/ask')
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/ask/stream')
       ? response({ detail: 'One or more documents are unavailable.' }, 400)
       : response([]))
     await user.type(screen.getByPlaceholderText('Ask a follow-up question…'), 'Explain?')
@@ -209,7 +211,8 @@ describe('Authentication screens', () => {
     const baseImpl = vi.mocked(fetch).getMockImplementation()!
     vi.mocked(fetch).mockImplementation(async (input, init) =>
       String(input).endsWith('/auth/login') ? response(ACCOUNT) :
-        String(input).endsWith('/documents') ? response([]) : baseImpl(input, init))
+        String(input).endsWith('/documents') ? response([]) :
+        String(input).endsWith('/conversations') ? response([]) : baseImpl(input, init))
     render(<App />)
     await screen.findByRole('heading', { name: 'Welcome back' })
     await user.type(screen.getByRole('textbox', { name: 'Username or email' }), 'student_a')

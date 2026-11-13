@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 from doubtdesk.answering.service import answer_question, resolve_answer
 from doubtdesk.answering.formatting import format_answer
 from doubtdesk.answering.fallback import generate_general_answer
-from doubtdesk.answering.vision import generate_vision_answer,load_page_image,build_vision_content
+from doubtdesk.answering.vision import generate_vision_answer, build_vision_content, build_grounded_content
 
 
 @pytest.fixture
@@ -130,20 +130,22 @@ def test_format_unsupported_status():
 
 
 def test_general_answer(client):
-    client.models.generate_content.return_value.text = "Gravity attracts masses."
+    client.responses.create.return_value.output_text = "Gravity attracts masses."
 
     result = generate_general_answer(
         client, "test-model", "What is gravity?"
     )
 
     assert result == "Gravity attracts masses."
-    client.models.generate_content.assert_called_once()
+    client.responses.create.assert_called_once()
+    assert client.responses.create.call_args.kwargs["reasoning"] == {"effort": "none"}
+    assert client.responses.create.call_args.kwargs["max_output_tokens"] == 300
 
 
 def test_general_answer_empty_response(client):
-    client.models.generate_content.return_value.text = None
+    client.responses.create.return_value.output_text = None
 
-    with pytest.raises(RuntimeError, match="could not generate an answer"):
+    with pytest.raises(RuntimeError, match="Model returned no answer"):
         generate_general_answer(client, "test-model", "What is gravity?")
 
 
@@ -151,45 +153,30 @@ def test_vision_empty_content(client):
     with pytest.raises(ValueError, match="Content cannot be empty"):
         generate_vision_answer(client, "test-model", [])
 
-def test_load_page_image(tmp_path):
+def test_build_vision_content_encodes_image_and_page_metadata(tmp_path):
+    import base64
+
     image_path = tmp_path / "page_001.png"
-    image_path.write_bytes(b"fake_png_data")
+    image_bytes = b"fake_png_data"
+    image_path.write_bytes(image_bytes)
+    pages = [{"doc_id": "doc_001", "page_number": 3, "image_path": image_path}]
 
-    result = load_page_image(image_path)
-
-    assert result.inline_data.mime_type == "image/png"
-    assert result.inline_data.data == b"fake_png_data"
-
-
-def test_load_missing_page_image(tmp_path):
-    image_path = tmp_path / "missing.png"
-
-    with pytest.raises(FileNotFoundError, match="Page image not found"):
-        load_page_image(image_path)
-
-
-def test_build_vision_content(tmp_path):
-    image_path = tmp_path / "page_001.png"
-    image_path.write_bytes(b"fake_png_data")
-
-    pages = [
-        {
-            "doc_id": "doc_001",
-            "page_number": 3,
-            "image_path": image_path,
-        }
-    ]
-
-    content = build_vision_content(
-        "What is photosynthesis?",
-        pages,
-    )
+    content = build_vision_content("What is photosynthesis?", pages)
 
     assert len(content) == 3
-    assert "What is photosynthesis?" in content[0]
-    assert "Document ID: doc_001" in content[1]
-    assert "PDF page number: 3" in content[1]
-    assert content[2].inline_data.mime_type == "image/png"
+    assert content[0] == {"type": "input_text", "text": "Student question: What is photosynthesis?"}
+    assert content[1]["type"] == "input_text"
+    assert "Document ID: doc_001" in content[1]["text"]
+    assert "PDF page number: 3" in content[1]["text"]
+    assert content[2]["type"] == "input_image"
+    assert content[2]["detail"] == "high"
+    assert content[2]["image_url"] == "data:image/png;base64," + base64.b64encode(image_bytes).decode()
+
+
+def test_build_vision_content_missing_image(tmp_path):
+    pages = [{"doc_id": "doc_001", "page_number": 3, "image_path": tmp_path / "missing.png"}]
+    with pytest.raises(FileNotFoundError, match="Page image not found"):
+        build_vision_content("What is photosynthesis?", pages)
 
 
 @pytest.mark.parametrize("question", ["", "   "])
@@ -202,6 +189,24 @@ def test_build_vision_content_no_pages():
     with pytest.raises(ValueError, match="At least one page is required"):
         build_vision_content("Explain gravity", [])
 
+
+def test_build_grounded_content_combines_text_and_image(tmp_path):
+    image_path = tmp_path / "page_003.png"
+    image_path.write_bytes(b"png")
+    content = build_grounded_content(
+        "Explain the nephron",
+        [{"doc_id": "doc_001", "page_number": 3, "text": "Bowman's capsule"}],
+        [{"doc_id": "doc_001", "page_number": 3, "image_path": image_path}],
+    )
+    assert len(content) == 4
+    assert "Bowman's capsule" in content[1]["text"]
+    assert content[3]["type"] == "input_image"
+
+
+def test_build_grounded_content_requires_evidence():
+    with pytest.raises(ValueError, match="At least one retrieved chunk or page image"):
+        build_grounded_content("Explain gravity", [], [])
+
 def test_generate_vision_answer(client):
     from doubtdesk.answering.schemas import EvidenceResult
 
@@ -211,7 +216,7 @@ def test_generate_vision_answer(client):
         sources=[],
     )
 
-    client.models.generate_content.return_value.parsed = evidence
+    client.responses.parse.return_value.output_parsed = evidence
 
     result = generate_vision_answer(
         client,
@@ -223,15 +228,17 @@ def test_generate_vision_answer(client):
     assert result.answer == ""
     assert result.sources == []
 
-    client.models.generate_content.assert_called_once()
+    client.responses.parse.assert_called_once()
+    assert client.responses.parse.call_args.kwargs["reasoning"] == {"effort": "none"}
+    assert client.responses.parse.call_args.kwargs["max_output_tokens"] == 300
 
 
 def test_generate_vision_answer_invalid_response(client):
-    client.models.generate_content.return_value.parsed = None
+    client.responses.parse.return_value.output_parsed = None
 
     with pytest.raises(
         RuntimeError,
-        match="did not return a valid structured response",
+        match="No structured evidence returned",
     ):
         generate_vision_answer(
             client,

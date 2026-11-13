@@ -39,4 +39,9 @@ __pycache__/
 frontend/coverage/
 frontend/test-results/
 frontend/playwright-report/
+
 /test_pdfs
+/examples
+*.tsbuildinfo
+*.backup_*
+*.bak-*

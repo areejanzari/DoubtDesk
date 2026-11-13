@@ -1,3 +1,4 @@
+import { streamResponse } from './test/mockStream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -32,8 +33,9 @@ beforeEach(() => {
     const url = String(input)
     if (url.endsWith('/auth/me')) return response(ACCOUNT)
     if (url.endsWith('/documents')) return response(documents)
+    if (url.endsWith('/conversations')) return response([])
     if (url.endsWith('/documents/upload')) return response({ filename: 'sample.pdf', status: 'completed', page_count: 2 })
-    if (url.endsWith('/ask')) return response(answer)
+    if (url.endsWith('/ask/stream')) return streamResponse(answer as Record<string, unknown>)
     if (url.endsWith('/auth/logout')) return response({ message: 'Logged out.' })
     return response({ detail: 'Not found' }, 404)
   })
@@ -246,6 +248,6 @@ describe('additional tutor behavior and failure paths', () => {
     fireEvent.change(textarea, { target: { value: 'How are stars formed?' } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     expect(await screen.findByText('Water is H2O.')).toBeInTheDocument()
-    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/ask'))).toBe(true)
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/ask/stream'))).toBe(true)
   })
 })
