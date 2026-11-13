@@ -1,1 +1,0 @@
-{"root":["./playwright.config.ts","./e2e/app.spec.ts","./e2e/full-system.spec.ts"],"version":"6.0.3"}

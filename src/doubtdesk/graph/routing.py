@@ -21,7 +21,7 @@ def route_evidence(
 def route_retrieval(
     state: DoubtDeskState,
 ) -> Literal["evidence", "fallback"]:
-    if state["retrieved_pages"]:
+    if state.get("retrieved_chunks"):
         return "evidence"
 
     return "fallback"

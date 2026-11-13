@@ -14,12 +14,14 @@ from doubtdesk.auth.routes import router as auth_router
 from doubtdesk.auth.schemas import SignupRequest
 from doubtdesk.auth.service import register_user
 from doubtdesk.auth.store import initialize_auth_db
-from doubtdesk.graph.builder import build_graph
+from doubtdesk.graph.builder import build_graph, build_preparation_graph
 from doubtdesk.ingestion.embeddings import load_embedding_model
 from doubtdesk.ingestion.registry import initialize_registry
 from doubtdesk.memory.store import initialize_memory_db
 from doubtdesk.retrieval.vector_store import get_collection
-from tests.e2e_support.fake_gemini import FakeGeminiClient
+from tests.e2e_support.fake_openai import FakeOpenAIClient, FakeOutputJudge
+from doubtdesk.conversations.routes import router as conversations_router
+from doubtdesk.memory.vector import get_memory_collection
 
 
 test_directory = tempfile.TemporaryDirectory(
@@ -64,21 +66,33 @@ async def lifespan(app: FastAPI):
 
     app.state.embedding_model = load_embedding_model()
     app.state.collection = get_collection()
-    app.state.gemini_client = FakeGeminiClient()
-    app.state.model_name = "fake-gemini"
+    app.state.llm_client = FakeOpenAIClient()
+    app.state.output_judge = FakeOutputJudge()
+    app.state.model_name = "fake-openai"
+    app.state.memory_collection = get_memory_collection()
     app.state.scope_classifier = FakeScopeClassifier()
     app.state.graph = build_graph(
         collection=app.state.collection,
         embedding_model=app.state.embedding_model,
-        client=app.state.gemini_client,
+        client=app.state.llm_client,
         model_name=app.state.model_name,
         scope_classifier=app.state.scope_classifier,
+        memory_collection=app.state.memory_collection,
+        output_judge=app.state.output_judge,
+    )
+    app.state.preparation_graph = build_preparation_graph(
+        collection=app.state.collection,
+        embedding_model=app.state.embedding_model,
+        client=app.state.llm_client,
+        model_name=app.state.model_name,
+        scope_classifier=app.state.scope_classifier,
+        memory_collection=app.state.memory_collection,
     )
 
     try:
         yield
     finally:
-        app.state.gemini_client.close()
+        app.state.llm_client.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -86,8 +100,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 app.include_router(router)
 app.include_router(auth_router)
+
+app.include_router(conversations_router)

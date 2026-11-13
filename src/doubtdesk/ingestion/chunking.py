@@ -7,7 +7,7 @@ def chunk_text(
 ) -> list[str]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    
+
     if not 0 <= overlap < chunk_size:
         raise ValueError("overlap must be smaller than chunk_size")
 

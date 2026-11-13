@@ -115,3 +115,30 @@ def record_gemini_failure(
             )
     except sqlite3.Error:
         logger.exception("Failed to save Gemini error analytics.")
+
+def record_openai_usage(*, response, request_id, conversation_id=None, operation, model,
+                        latency_ms=None, db_path=DB_PATH):
+    usage = getattr(response, "usage", None)
+    if usage is None or not request_id:
+        return
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """INSERT INTO ai_usage
+                    (request_id, conversation_id, operation, model, prompt_tokens,
+                     output_tokens, thinking_tokens, cached_tokens, total_tokens,
+                     latency_ms, status)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success')""",
+                (
+                    request_id, conversation_id, operation, model,
+                    getattr(usage, "input_tokens", None),
+                    getattr(usage, "output_tokens", None),
+                    getattr(output_details, "reasoning_tokens", None),
+                    getattr(input_details, "cached_tokens", None),
+                    getattr(usage, "total_tokens", None), latency_ms,
+                ),
+            )
+    except sqlite3.Error:
+        logger.exception("Failed to record OpenAI usage")

@@ -7,6 +7,11 @@ class DoubtDeskState(TypedDict, total=False):
     question: str
     doc_ids: list[str]
     retrieved_pages: list[dict]
+    retrieved_chunks: list[dict]
+    retrieval_candidate_count: int
+    evidence_pages: list[dict]
+    evidence_mode: str
+    evidence_assessment: object
     evidence: EvidenceResult
     status: str
     answer: str
@@ -19,3 +24,15 @@ class DoubtDeskState(TypedDict, total=False):
     resolved_question: str
     request_id: str
     
+    evidence_tier: str
+    skip_output_judge: bool
+    judge_passed: bool
+    judge_attempts: int
+
+    evidence_average: float | None
+    judge_reviews: list[dict]
+    judge_failure_reason: str | None
+    judge_regenerations: int
+    judge_needs_fallback: bool
+    judge_fallback_attempted: bool
+    verification_failed: bool

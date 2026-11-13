@@ -12,6 +12,7 @@ def group_chunks_by_page(chunks: list[dict]) -> list[dict]:
                 "doc_id": chunk["doc_id"],
                 "page_number": chunk["page_number"],
                 "distance": chunk["distance"],
+                "rrf_score": chunk.get("rrf_score", 0.0),
                 "chunks": [],
             }
 
@@ -21,10 +22,14 @@ def group_chunks_by_page(chunks: list[dict]) -> list[dict]:
             pages[key]["distance"],
             chunk["distance"],
         )
+        pages[key]["rrf_score"] = max(
+            pages[key]["rrf_score"],
+            chunk.get("rrf_score", 0.0),
+        )
 
     return sorted(
         pages.values(),
-        key=lambda page: page["distance"],
+        key=lambda page: (-page["rrf_score"], page["distance"]),
     )
 
 

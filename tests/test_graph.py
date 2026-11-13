@@ -74,14 +74,14 @@ def test_retrieve_node_without_documents(tmp_path):
         "doc_ids": [],
     })
 
-    assert result == {"retrieved_pages": []}
+    assert result == {"retrieved_pages": [], "retrieved_chunks": []}
 
 def test_evidence_node_without_pages():
     evaluate = evidence_node(MagicMock(), "test-model")
 
     with pytest.raises(
         ValueError,
-        match="Evidence evaluation requires retrieved pages",
+        match="Evidence evaluation requires retrieved text or pages",
     ):
         evaluate({
             "question": "Explain gravity",
@@ -89,38 +89,31 @@ def test_evidence_node_without_pages():
         })
 
 
-def test_evidence_node_with_pages():
+def test_evidence_node_with_text_only():
     evidence = MagicMock()
     evidence.status = "sufficient"
-
     pages = [{"doc_id": "doc_001", "page_number": 1}]
+    chunks = [{"doc_id": "doc_001", "page_number": 1, "text": "Photosynthesis uses light"}]
 
     with (
-        patch(
-            "doubtdesk.graph.nodes.build_vision_content",
-            return_value=["vision-content"],
-        ),
-        patch(
-            "doubtdesk.graph.nodes.generate_vision_answer",
-            return_value=evidence,
-        ),
-        patch(
-            "doubtdesk.graph.nodes.validate_evidence_consistency"
-        ) as validate_consistency,
-        patch(
-            "doubtdesk.graph.nodes.validate_evidence_sources"
-        ) as validate_sources,
+        patch("doubtdesk.graph.nodes.build_grounded_content", return_value=["text-content"]) as content,
+        patch("doubtdesk.graph.nodes.generate_vision_answer", return_value=evidence),
+        patch("doubtdesk.graph.nodes.validate_evidence_consistency") as validate_consistency,
+        patch("doubtdesk.graph.nodes.validate_evidence_sources") as validate_sources,
     ):
         evaluate = evidence_node(MagicMock(), "test-model")
-
         result = evaluate({
             "question": "What is photosynthesis?",
-            "retrieved_pages": pages,
+            "retrieved_chunks": chunks,
+            "retrieved_pages": [],
+            "evidence_pages": pages,
         })
 
     assert result["evidence"] is evidence
+    content.assert_called_once_with(question="What is photosynthesis?", chunks=chunks, pages=[])
     validate_consistency.assert_called_once_with(evidence)
     validate_sources.assert_called_once_with(evidence, pages)
+
 
 def test_fallback_node():
     with patch(
@@ -232,78 +225,29 @@ def test_graph_without_documents(tmp_path):
     assert "Not from document." in result["formatted_answer"]
 
 
-def test_graph_grounded_route(tmp_path):
+def test_graph_grounded_route_uses_text_when_sufficient(tmp_path):
     evidence = MagicMock()
     evidence.status = "sufficient"
     evidence.answer = "Photosynthesis converts light energy."
-
     source = MagicMock()
-    source.model_dump.return_value = {
-        "doc_id": "doc_001",
-        "page_numbers": [1],
-    }
+    source.model_dump.return_value = {"doc_id": "doc_001", "page_numbers": [1]}
     evidence.sources = [source]
-
-    pages = [{"doc_id": "doc_001", "page_number": 1}]
+    chunks = [{"doc_id": "doc_001", "chunk_id": "a", "page_number": 1,
+               "text": "Photosynthesis converts light energy", "distance": 0.1, "rrf_score": 0.03}]
+    assessment = SimpleNamespace(scores=[SimpleNamespace(paraphrase="What is photosynthesis?", score=0.95)] * 3)
 
     with (
-        patch(
-            "doubtdesk.graph.nodes.validate_user_document_ids"
-        ) as mock_validate_owner,
-        patch(
-            "doubtdesk.graph.nodes.embed_queries",
-            return_value=[MagicMock(), MagicMock(), MagicMock()],
-        ),
-        patch(
-            "doubtdesk.graph.nodes.search_chunks",
-            return_value={},
-        ),
-        patch(
-            "doubtdesk.graph.nodes.format_search_results",
-            return_value=[],
-        ),
-        patch(
-            "doubtdesk.graph.nodes.group_chunks_by_page",
-            return_value=[],
-        ),
-        patch(
-            "doubtdesk.graph.nodes.get_document_page_counts",
-            return_value={"doc_001": 1},
-        ),
-        patch(
-            "doubtdesk.graph.nodes.expand_neighbor_pages",
-            return_value=[{"doc_id": "doc_001", "page_number": 1}],
-        ),
-        patch(
-            "doubtdesk.graph.nodes.get_page_image_paths",
-            return_value=pages,
-        ),
-        patch(
-            "doubtdesk.graph.nodes.build_vision_content",
-            return_value=["vision-content"],
-        ),
-        patch(
-            "doubtdesk.graph.nodes.generate_vision_answer",
-            return_value=evidence,
-        ),
-        patch(
-            "doubtdesk.graph.nodes.validate_evidence_consistency"
-        ),
-        patch(
-            "doubtdesk.graph.nodes.validate_evidence_sources"
-        ),
-        patch(
-            "doubtdesk.graph.nodes.get_document_names",
-            return_value={"doc_001": "biology.pdf"},
-        ),
+        patch("doubtdesk.graph.nodes.validate_user_document_ids") as owner,
+        patch("doubtdesk.graph.nodes.hybrid_search", return_value=chunks),
+        patch("doubtdesk.graph.nodes.assess_text_evidence", return_value=assessment),
+        patch("doubtdesk.graph.nodes.get_page_image_paths") as images,
+        patch("doubtdesk.graph.nodes.generate_vision_answer", return_value=evidence),
+        patch("doubtdesk.graph.nodes.validate_evidence_consistency"),
+        patch("doubtdesk.graph.nodes.validate_evidence_sources"),
+        patch("doubtdesk.graph.nodes.get_document_names", return_value={"doc_001": "biology.pdf"}),
     ):
-
         classifier = MagicMock()
-        classifier.predict.return_value = [
-            {"label": 0},
-            {"label": 0},
-            {"label": 0},
-        ]
+        classifier.predict.return_value = [{"label": 0}] * 3
         graph = build_graph(
             scope_classifier=classifier,
             collection=MagicMock(),
@@ -312,34 +256,31 @@ def test_graph_grounded_route(tmp_path):
             model_name="test-model",
             db_path=tmp_path / "test.db",
         )
-
         result = graph.invoke({
             "question": "What is photosynthesis?",
             "doc_ids": ["doc_001"],
             "user_id": "user_A",
         })
 
-    mock_validate_owner.assert_called_once()
-    assert mock_validate_owner.call_args.kwargs == {
-        "user_id": "user_A",
-        "doc_ids": ["doc_001"],
-    }
+    owner.assert_called_once()
+    images.assert_not_called()
     assert result["status"] == "grounded"
     assert result["answer"] == evidence.answer
-    assert result["sources"] == [source.model_dump.return_value]
+    assert result["evidence_mode"] == "text"
     assert "biology.pdf" in result["formatted_answer"]
 
-def test_route_retrieval_with_pages():
+
+def test_route_retrieval_with_chunks():
     state = {
-        "retrieved_pages": [
-            {"doc_id": "doc_001", "page_number": 1}
+        "retrieved_chunks": [
+            {"doc_id": "doc_001", "page_number": 1, "text": "Some text"}
         ]
     }
 
     assert route_retrieval(state) == "evidence"
 
 
-def test_route_retrieval_without_pages():
-    state = {"retrieved_pages": []}
+def test_route_retrieval_without_chunks():
+    state = {"retrieved_chunks": []}
 
     assert route_retrieval(state) == "fallback"

@@ -33,7 +33,7 @@ def test_retrieve_node_rejects_other_user_before_embedding(tmp_path):
 
     assert retrieve({
         "user_id": "user_B", "question": "General question", "doc_ids": []
-    }) == {"retrieved_pages": []}
+    }) == {"retrieved_chunks": [], "retrieved_pages": []}
 
 
 def test_chroma_document_filter_overrides_vector_similarity():

@@ -5,6 +5,9 @@ def format_answer(
 ) -> str:
     answer = response["answer"].strip()
 
+    if response["status"] == "verification_failed":
+        return answer
+
     if response["status"] == "general_knowledge":
         return f"{answer}\n\nNot from document."
 

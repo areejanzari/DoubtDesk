@@ -1,4 +1,3 @@
-from google import genai
 from doubtdesk.answering.schemas import EvidenceResult
 from doubtdesk.answering.fallback import generate_general_answer
 from doubtdesk.answering.validation import (
@@ -14,7 +13,7 @@ def resolve_answer(
         result: EvidenceResult,
         pages: list[dict],
         question: str,
-        client: genai.Client,
+        client,
         model_name: str,
 ) -> dict:
     validate_evidence_consistency(result)
@@ -45,7 +44,7 @@ def resolve_answer(
 def answer_question(
     question: str,
     pages: list[dict],
-    client: genai.Client,
+    client,
     model_name: str,
 ) -> dict:
     if not question.strip():

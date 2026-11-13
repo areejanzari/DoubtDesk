@@ -70,6 +70,7 @@ def service_mocks():
         patch(
             "doubtdesk.ingestion.service.store_chunks"
         ) as store,
+        patch("doubtdesk.ingestion.service.replace_document_chunks"),
     ):
         yield {
             "get_document": get_document,

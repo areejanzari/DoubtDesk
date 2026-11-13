@@ -11,14 +11,18 @@ import {
   Search, Settings, X, ZoomIn, ZoomOut, Maximize2, LogOut,
 } from 'lucide-react'
 import 'katex/dist/katex.min.css'
-import { apiRequest, authApi, jsonPost } from './auth/api'
+import { apiRequest, authApi } from './auth/api'
+import { conversationApi } from './chat/conversations'
+import type { ConversationSummary, ConversationDetail } from './chat/conversations'
+import { ConversationSidebar } from './chat/ConversationSidebar'
+import { streamAsk } from './chat/stream'
 import type { AuthUser } from './auth/api'
 import { AuthScreen } from './auth/AuthScreen'
 
 const PAGE_IMAGE_TEMPLATE = import.meta.env.VITE_PAGE_IMAGE_URL_TEMPLATE || '/documents/{doc_id}/pages/{page}/image'
 
 type DocumentInfo = { doc_id: string; filename: string; page_count: number }
-type AnswerStatus = 'grounded' | 'general_knowledge' | 'out_of_scope' | 'unknown'
+type AnswerStatus = 'grounded' | 'general_knowledge' | 'out_of_scope' | 'verification_failed' | 'unknown'
 type Source = { docId?: string; filename: string; page: number; excerpt?: string }
 type Message = {
   id: number
@@ -29,7 +33,7 @@ type Message = {
   error?: boolean
 }
 type AskResponse = {
-  status: 'grounded' | 'general_knowledge' | 'out_of_scope'
+  status: AnswerStatus
   answer: string
   formatted_answer: string
   sources: unknown
@@ -105,6 +109,10 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
   const [question, setQuestion] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [conversationId, setConversationId] = useState<string | null>(null)
+  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState('')
+  const [answerStage, setAnswerStage] = useState('Thinking…')
   const [isAnswering, setIsAnswering] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadMessage, setUploadMessage] = useState('')
@@ -136,6 +144,98 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
     }
   }, [onUnauthorized])
 
+  const loadConversations = useCallback(async () => {
+    try {
+      const recent = await conversationApi.list(onUnauthorized)
+      setConversations(recent)
+      setHistoryError('')
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : 'Unable to load conversations')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [onUnauthorized])
+
+  function loadSavedMessages(history: ConversationDetail) {
+    const restored: Message[] = []
+    for (const exchange of history.messages) {
+      restored.push({ id: nextId(), role: 'user', content: exchange.question })
+      const status: AnswerStatus = ['grounded', 'general_knowledge', 'out_of_scope', 'verification_failed'].includes(exchange.status)
+        ? exchange.status as AnswerStatus : 'unknown'
+      const sources = status === 'grounded'
+        ? extractSources(exchange.sources, documents)
+        : []
+      restored.push({
+        id: nextId(), role: 'assistant', content: exchange.answer, status,
+        sources: sources.length ? sources : status === 'grounded'
+          ? sourcesFromAnswer(exchange.formatted_answer, documents) : [],
+      })
+    }
+    setMessages(restored)
+    setConversationId(history.conversation_id)
+    setSelectedDocIds((history.messages.at(-1)?.doc_ids || []).filter(id => documents.some(doc => doc.doc_id === id)))
+    setViewerSource(null)
+    setMobileSidebarOpen(false)
+  }
+
+  async function openConversation(id: string) {
+    if (isAnswering) return
+    try {
+      const detail = await conversationApi.get(id, onUnauthorized)
+      loadSavedMessages(detail)
+      setHistoryError('')
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : 'Unable to open this chat')
+    }
+  }
+
+  async function startConversation() {
+    if (isAnswering || conversations.length >= 30) return
+    try {
+      const created = await conversationApi.create(user.csrf_token, onUnauthorized)
+      setConversationId(created.conversation_id)
+      setMessages([])
+      setQuestion('')
+      setViewerSource(null)
+      setSelectedDocIds([])
+      setConversations(old => [created, ...old])
+      setHistoryError('')
+      setMobileSidebarOpen(false)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to create a chat'
+      await loadConversations()
+      setHistoryError(message)
+    }
+  }
+
+  async function renameConversation(id: string, title: string) {
+    try {
+      const updated = await conversationApi.rename(id, title, user.csrf_token, onUnauthorized)
+      setConversations(old => old.map(item => item.conversation_id === id ? updated : item))
+      setHistoryError('')
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : 'Unable to rename chat')
+      throw error
+    }
+  }
+
+  async function deleteConversation(id: string) {
+    try {
+      await conversationApi.remove(id, user.csrf_token, onUnauthorized)
+      setConversations(old => old.filter(item => item.conversation_id !== id))
+      if (conversationId === id) {
+        setConversationId(null)
+        setMessages([])
+        setQuestion('')
+        setSelectedDocIds([])
+      }
+      setHistoryError('')
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : 'Unable to delete chat')
+    }
+  }
+
+  useEffect(() => { void loadConversations() }, [loadConversations])
   useEffect(() => { void loadDocuments() }, [loadDocuments])
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }) }, [messages, isAnswering])
 
@@ -169,29 +269,66 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
   async function submitQuestion() {
     const text = question.trim()
     if (!text || isAnswering) return
+    if (!conversationId && conversations.length >= 30) {
+      setHistoryError('30-chat limit reached. Delete a conversation to start another.')
+      return
+    }
+    const userMessageId = nextId()
+    const assistantMessageId = nextId()
     setQuestion('')
-    setMessages((old) => [...old, { id: nextId(), role: 'user', content: text }])
+    setMessages(old => [...old, { id: userMessageId, role: 'user', content: text }])
     setIsAnswering(true)
+    setAnswerStage('Preparing…')
     try {
-      const answerData = await jsonPost<AskResponse>('/ask', {
+      await streamAsk({
         question: text,
         doc_ids: selectedDocIds,
         ...(conversationId ? { conversation_id: conversationId } : {}),
-      }, user.csrf_token, onUnauthorized)
-      if (typeof answerData.answer !== 'string') throw new Error('Unexpected answer response')
-      if (answerData.conversation_id) setConversationId(answerData.conversation_id)
-      const content = answerData.answer || answerData.formatted_answer || 'No answer was returned.'
-      const status: AnswerStatus = answerData.status === 'grounded' || answerData.status === 'general_knowledge' || answerData.status === 'out_of_scope' ? answerData.status : 'unknown'
-      const parsedSources = status === 'grounded' ? extractSources(answerData.sources, documents) : []
-      const sources = status === 'grounded'
-        ? (parsedSources.length ? parsedSources : sourcesFromAnswer(answerData.formatted_answer || '', documents))
-        : []
-      setMessages((old) => [...old, { id: nextId(), role: 'assistant', content, status, sources }])
+      }, user.csrf_token, onUnauthorized, ({ event, data }) => {
+        if (event === 'status') {
+          const stage = typeof data.stage === 'string' ? data.stage : 'generating'
+          setAnswerStage(stage === 'checking' ? 'Verifying…' : stage === 'preparing' ? 'Preparing…' : 'Generating…')
+        }
+        if (event === 'token' && typeof data.text === 'string') {
+          const token = data.text
+          setMessages(old => {
+            const existing = old.find(message => message.id === assistantMessageId)
+            return existing
+              ? old.map(message => message.id === assistantMessageId ? { ...message, content: message.content + token } : message)
+              : [...old, { id: assistantMessageId, role: 'assistant', content: token }]
+          })
+        }
+        if (event === 'complete') {
+          const result = data as unknown as AskResponse
+          if (typeof result.answer !== 'string') throw new Error('Unexpected answer response')
+          if (result.conversation_id) setConversationId(result.conversation_id)
+          const status: AnswerStatus = ['grounded', 'general_knowledge', 'out_of_scope', 'verification_failed'].includes(result.status)
+            ? result.status : 'unknown'
+          const parsedSources = status === 'grounded' ? extractSources(result.sources, documents) : []
+          const sources = status === 'grounded'
+            ? parsedSources.length ? parsedSources : sourcesFromAnswer(result.formatted_answer || '', documents)
+            : []
+          setMessages(old => {
+            const saved = { id: assistantMessageId, role: 'assistant' as const, content: result.answer, status, sources }
+            return old.some(message => message.id === assistantMessageId)
+              ? old.map(message => message.id === assistantMessageId ? saved : message)
+              : [...old, saved]
+          })
+        }
+      })
+      await loadConversations()
     } catch (error) {
-      setMessages((old) => [...old, { id: nextId(), role: 'assistant',
-        content: error instanceof Error ? error.message : 'Something went wrong.', error: true }])
+      const message = error instanceof Error ? error.message : 'Something went wrong.'
+      setMessages(old => {
+        const failure: Message = { id: assistantMessageId, role: 'assistant', content: message, error: true }
+        return old.some(item => item.id === assistantMessageId)
+          ? old.map(item => item.id === assistantMessageId ? failure : item)
+          : [...old, failure]
+      })
+      await loadConversations()
     } finally {
       setIsAnswering(false)
+      setAnswerStage('Thinking…')
     }
   }
 
@@ -270,7 +407,10 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
             {uploading ? <LoaderCircle className="animate-spin" size={17} /> : <Plus size={17} />}{uploading ? 'Processing PDF…' : 'Upload PDF'}
           </button>
           {uploadMessage && <p role="status" className="mb-3 rounded-lg bg-white px-2.5 py-2 text-xs leading-5 text-slate-600">{uploadMessage}</p>}
-          <div className="mb-3 flex items-center justify-between px-1"><span className="text-xs font-semibold uppercase tracking-wider text-slate-500">All Documents</span><span className="rounded-md bg-white px-2 py-0.5 text-xs text-slate-500">{documents.length}</span></div>
+          <ConversationSidebar conversations={conversations} activeId={conversationId} busy={isAnswering}
+            loading={historyLoading} error={historyError} onNew={() => void startConversation()}
+            onOpen={id => void openConversation(id)} onRename={renameConversation} onDelete={deleteConversation} />
+          <div className="mb-3 mt-4 flex items-center justify-between px-1"><span className="text-xs font-semibold uppercase tracking-wider text-slate-500">All Documents</span><span className="rounded-md bg-white px-2 py-0.5 text-xs text-slate-500">{documents.length}</span></div>
           <div className="relative mb-3"><Search size={16} className="absolute left-3 top-2.5 text-slate-400" /><input value={documentSearch} onChange={(e) => setDocumentSearch(e.target.value)} placeholder="Search documents" className="field w-full pl-9 text-sm" /></div>
           <div className="mb-3 flex flex-wrap gap-1.5">{['All', 'Biology', 'Chemistry', 'Physics'].map((name) => <button key={name} onClick={() => setSubject(name)} className={`rounded-lg px-2 py-1 text-xs transition ${subject === name ? 'bg-blue-100 font-semibold text-[#3155E7]' : 'bg-white text-slate-500 hover:bg-slate-100'}`}>{name}</button>)}</div>
           {documentError && <p role="alert" className="mb-2 text-xs text-red-600">{documentError} <button className="underline" onClick={() => void loadDocuments()}>Retry</button></p>}
@@ -285,7 +425,7 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
               </label>
             })}
           </div>
-          <div className="mt-4 border-t border-slate-200 pt-4"><div className="flex items-center gap-2 px-2 text-sm font-medium text-slate-600"><BookOpen size={17} /> Current chat</div><p className="mt-1 px-2 text-xs text-slate-400">History lasts until this page is refreshed.</p><div className="mt-4 flex items-center gap-2 px-2 text-sm text-slate-400"><Settings size={17} /> Settings unavailable</div></div>
+          <div className="mt-4 border-t border-slate-200 pt-4"><div className="flex items-center gap-2 px-2 text-sm text-slate-500"><BookOpen size={17} /> Saved conversations</div><p className="mt-1 px-2 text-xs text-slate-400">Up to 30 chats per account.</p><div className="mt-3 flex items-center gap-2 px-2 text-sm text-slate-400"><Settings size={17} /> Settings unavailable</div></div>
         </div>
       </aside>
 
@@ -305,14 +445,14 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
             {messages.map((message) => <article key={message.id} className={message.role === 'user' ? 'flex justify-end' : 'flex items-start gap-3'}>
               {message.role === 'assistant' && <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-[#4169FF]"><GraduationCap size={17} /></div>}
               <div className={message.role === 'user' ? 'max-w-[88%] rounded-2xl rounded-tr-md bg-[#EEF2FF] px-4 py-3 text-sm leading-7 sm:max-w-[78%]' : 'min-w-0 max-w-full flex-1'}>
-                {message.role === 'assistant' && <div className="mb-2 flex flex-wrap items-center gap-2"><span className="text-sm font-semibold">DoubtDesk</span>{message.status === 'grounded' && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">From documents</span>}{message.status === 'general_knowledge' && <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">Not from document</span>}{message.status === 'out_of_scope' && <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">Outside academic scope</span>}{message.error && <span className="text-xs text-red-600">Request failed</span>}</div>}
+                {message.role === 'assistant' && <div className="mb-2 flex flex-wrap items-center gap-2"><span className="text-sm font-semibold">DoubtDesk</span>{message.status === 'grounded' && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">From documents</span>}{message.status === 'general_knowledge' && <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">Not from document</span>}{message.status === 'verification_failed' && <span className="rounded-full bg-red-50 px-2 py-0.5 text-xs text-red-700">Verification unavailable</span>}{message.status === 'out_of_scope' && <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">Outside academic scope</span>}{message.error && <span className="text-xs text-red-600">Request failed</span>}</div>}
                 {message.role === 'assistant' ? <MarkdownContent content={message.content} /> : <p className="whitespace-pre-wrap break-words">{message.content}</p>}
                 {message.role === 'assistant' && <div className="mt-4 space-y-2"><button className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-slate-500 hover:bg-slate-100" onClick={() => { void navigator.clipboard.writeText(message.content).then(() => { setCopiedId(message.id); window.setTimeout(() => setCopiedId(null), 1500) }).catch(() => {}) }}>{copiedId === message.id ? <Check size={14} /> : <Clipboard size={14} />}{copiedId === message.id ? 'Copied' : 'Copy answer'}</button>
                   {!!message.sources?.length && <div className="border-t border-slate-100 pt-3"><p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Sources</p><div className="flex flex-wrap gap-2">{message.sources.map((source, index) => <button key={`${source.filename}-${source.page}-${index}`} className="flex max-w-full items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:border-blue-300 hover:bg-blue-50" onClick={() => openSource(source)}><FileText size={16} className="mt-0.5 shrink-0 text-[#4169FF]" /><span className="min-w-0"><span className="block break-all text-xs font-medium">[{index + 1}] {source.filename}</span><span className="text-xs text-slate-500">Page {source.page}</span>{source.excerpt && <span className="mt-1 block line-clamp-2 text-xs text-slate-500">{source.excerpt}</span>}</span></button>)}</div></div>}
                 </div>}
               </div>
             </article>)}
-            {isAnswering && <div className="flex items-center gap-3 text-sm text-slate-500"><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-50 text-[#4169FF]"><Bot size={17} /></div><LoaderCircle className="animate-spin text-[#4169FF]" size={17} /> Thinking…</div>}
+            {isAnswering && <div className="flex items-center gap-3 text-sm text-slate-500"><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-50 text-[#4169FF]"><Bot size={17} /></div><LoaderCircle className="animate-spin text-[#4169FF]" size={17} /> {answerStage}</div>}
             <div ref={chatEndRef} />
           </div>
         </div>

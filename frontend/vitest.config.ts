@@ -12,9 +12,15 @@ export default defineConfig({
   exclude: ['e2e/**', 'node_modules/**'],
   coverage: {
     provider: 'v8',
-    reporter: ['text', 'html'],
+    reporter: ['text', 'html', 'json-summary'],
     include: ['src/**/*.{ts,tsx}'],
     exclude: ['src/main.tsx', 'src/test/**'],
+    thresholds: {
+      lines: 80,
+      statements: 80,
+      functions: 80,
+      branches: 80,
+    },
   },
 },
 })

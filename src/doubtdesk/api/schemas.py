@@ -24,7 +24,7 @@ class AskRequest(BaseModel):
         return question
 
 class AskResponse(BaseModel):
-    status: Literal["grounded", "general_knowledge","out_of_scope"]
+    status: Literal["grounded", "general_knowledge", "out_of_scope", "verification_failed"]
     answer: str
     sources: list[DocumentSource]
     formatted_answer: str

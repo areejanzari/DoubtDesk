@@ -16,6 +16,7 @@ from doubtdesk.ingestion.embeddings import (
     load_embedding_model,
     embed_chunks,
 )
+from doubtdesk.retrieval.lexical_store import replace_document_chunks
 from doubtdesk.retrieval.vector_store import (
     get_collection,
     store_chunks,
@@ -85,6 +86,8 @@ def process_pdf(
 
         if chunks:
             store_chunks(collection, chunks, embeddings)
+
+        replace_document_chunks(doc_id, chunks)
 
         update_document_status(doc_id, "completed", len(pages))
 

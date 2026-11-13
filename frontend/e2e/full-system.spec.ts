@@ -47,4 +47,8 @@ test('uploads a PDF, asks a question, and opens its citation', async ({ page }) 
   await expect.poll(
     () => pageImage.evaluate(img => (img as HTMLImageElement).naturalWidth),
   ).toBeGreaterThan(0)
+  await expect(page.getByRole('button', { name: 'What does photosynthesis convert?', exact: true })).toBeVisible()
+  await page.reload()
+  await page.getByRole('button', { name: 'What does photosynthesis convert?', exact: true }).click()
+  await expect(page.getByText('Photosynthesis converts light energy into chemical energy.')).toBeVisible()
 })
