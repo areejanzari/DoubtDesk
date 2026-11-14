@@ -2,20 +2,33 @@ import os
 import smtplib
 from email.message import EmailMessage
 from urllib.parse import urlencode
-from dotenv import load_dotenv
 
-def send_verification_email(
-    to_email: str,
-    token: str,
-) -> None:
-    load_dotenv()
-
+def _send(to_email: str, subject: str, body: str) -> None:
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_user = os.environ["SMTP_USER"]
     smtp_password = os.environ["SMTP_PASSWORD"]
     smtp_from = os.getenv("SMTP_FROM", smtp_user)
 
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = smtp_from
+    message["To"] = to_email
+    message.set_content(body)
+
+    with smtplib.SMTP_SSL(
+        smtp_host,
+        smtp_port,
+        timeout=15,
+    ) as smtp:
+        smtp.login(smtp_user, smtp_password)
+        smtp.send_message(message)
+
+
+def send_verification_email(
+    to_email: str,
+    token: str,
+) -> None:
     frontend_url = os.getenv(
         "AUTH_FRONTEND_URL",
         "http://localhost:5173",
@@ -26,12 +39,7 @@ def send_verification_email(
         f"{urlencode({'token': token})}"
     )
 
-    message = EmailMessage()
-    message["Subject"] = "Verify your DoubtDesk account"
-    message["From"] = smtp_from
-    message["To"] = to_email
-
-    message.set_content(
+    _send(to_email, "Verify your DoubtDesk account",
         f"""
 Welcome to DoubtDesk!
 
@@ -47,27 +55,12 @@ DoubtDesk Team
 """.strip()
     )
 
-    with smtplib.SMTP_SSL(
-        smtp_host,
-        smtp_port,
-        timeout=15,
-    ) as smtp:
-        smtp.login(smtp_user, smtp_password)
-        smtp.send_message(message)
 
 
 def send_password_reset_email(
     to_email: str,
     token: str,
 ) -> None:
-    load_dotenv()
-
-    smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.getenv("SMTP_PORT", "465"))
-    smtp_user = os.environ["SMTP_USER"]
-    smtp_password = os.environ["SMTP_PASSWORD"]
-    smtp_from = os.getenv("SMTP_FROM", smtp_user)
-
     frontend_url = os.getenv(
         "AUTH_FRONTEND_URL",
         "http://localhost:5173",
@@ -78,12 +71,7 @@ def send_password_reset_email(
         f"{urlencode({'token': token})}"
     )
 
-    message = EmailMessage()
-    message["Subject"] = "Reset your DoubtDesk password"
-    message["From"] = smtp_from
-    message["To"] = to_email
-
-    message.set_content(
+    _send(to_email, "Reset your DoubtDesk password",
         f"""
 Hello!
 
@@ -100,11 +88,3 @@ If you didn't request this, ignore this email.
 DoubtDesk Team
 """.strip()
     )
-
-    with smtplib.SMTP_SSL(
-        smtp_host,
-        smtp_port,
-        timeout=15,
-    ) as smtp:
-        smtp.login(smtp_user, smtp_password)
-        smtp.send_message(message)

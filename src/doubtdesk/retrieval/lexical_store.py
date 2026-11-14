@@ -1,4 +1,6 @@
+from doubtdesk.config import settings
 import re
+from threading import Lock
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -6,7 +8,8 @@ from pathlib import Path
 from doubtdesk.ingestion.schemas import ChunkRecord
 
 
-LEXICAL_DB = Path("data/lexical.db")
+LEXICAL_DB = settings.lexical_db
+STOPWORDS = frozenset("a an the is are am was were be been being of to in on at for from by with as and or what which who whom how why when where does do did can could would should will may might has have had this that these those it its you your i me my explain describe tell give".split())
 
 
 def tokenize(text: str) -> list[str]:
@@ -33,12 +36,28 @@ def initialize_lexical_index(db_path: Path = LEXICAL_DB) -> None:
         """)
 
 
+_initialized_indexes = {}
+_index_lock = Lock()
+
+
+def _ensure_index(db_path):
+    path = Path(db_path).resolve()
+    with _index_lock:
+        if path.exists():
+            stat = path.stat()
+            if _initialized_indexes.get(path) == (stat.st_dev, stat.st_ino):
+                return
+        initialize_lexical_index(path)
+        stat = path.stat()
+        _initialized_indexes[path] = (stat.st_dev, stat.st_ino)
+
+
 def replace_document_chunks(
     doc_id: str,
     chunks: list[ChunkRecord],
     db_path: Path = LEXICAL_DB,
 ) -> None:
-    initialize_lexical_index(db_path)
+    _ensure_index(db_path)
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("DELETE FROM chunk_fts WHERE doc_id = ?", (doc_id,))
         conn.executemany(
@@ -68,7 +87,7 @@ def lexical_candidates(
         return []
     if top_k <= 0:
         raise ValueError("top_k must be positive")
-    initialize_lexical_index(db_path)
+    _ensure_index(db_path)
     placeholders = ", ".join("?" for _ in doc_ids)
     statement = f"""
         SELECT chunk_id, doc_id, page_number, text
@@ -81,6 +100,8 @@ def lexical_candidates(
     with closing(sqlite3.connect(db_path)) as conn:
         for question in questions:
             words = list(dict.fromkeys(tokenize(question)))
+            significant = [word for word in words if word not in STOPWORDS]
+            words = significant or words
             if not words:
                 result.append([])
                 continue
@@ -100,7 +121,7 @@ def lexical_candidates(
 
 def backfill_missing_documents(
     collection,
-    documents_db: Path = Path("data/documents.db"),
+    documents_db: Path = settings.documents_db,
     lexical_db: Path = LEXICAL_DB,
 ) -> int:
     initialize_lexical_index(lexical_db)

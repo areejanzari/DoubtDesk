@@ -1,4 +1,7 @@
-from doubtdesk.observability.tracing import observe_llm_response
+from doubtdesk.observability.tracing import observe_llm_response, trace_generation
+
+
+ANSWER_MAX_OUTPUT_TOKENS = 300
 
 
 GENERAL_INSTRUCTIONS = (
@@ -29,13 +32,14 @@ def generate_general_answer(
 ) -> str:
     if not question.strip():
         raise ValueError("Question cannot be empty")
-    response = client.responses.create(
-        model=model_name,
-        input=general_input(question, feedback),
-        reasoning={"effort": "none"},
-        max_output_tokens=300,
-    )
-    observe_llm_response("general_answer", response, model_name, request_id, conversation_id)
+    with trace_generation("general_answer", model_name, request_id, input={"question": question, "regeneration": bool(feedback)}):
+        response = client.responses.create(
+            model=model_name,
+            input=general_input(question, feedback),
+            reasoning={"effort": "none"},
+            max_output_tokens=ANSWER_MAX_OUTPUT_TOKENS,
+        )
+        observe_llm_response("general_answer", response, model_name, request_id, conversation_id)
     answer = response.output_text
     if not answer:
         raise RuntimeError("Model returned no answer")

@@ -15,7 +15,6 @@ from doubtdesk.ingestion.registry import (
     get_document_page_counts,
     get_document_names,
     list_documents,
-    update_document_filename,
     attach_document_to_user,
     validate_user_document_ids,
     user_can_access_document,
@@ -126,9 +125,11 @@ def test_get_document_page_counts(populated_db):
 
 
 def test_get_document_names(populated_db):
+    attach_document_to_user("user_A", "doc_001", "biology.pdf", populated_db)
+    attach_document_to_user("user_A", "doc_002", "chemistry.pdf", populated_db)
     with sqlite3.connect(populated_db) as conn:
         result = get_document_names(
-            conn, ["doc_001", "doc_002", "doc_003"]
+            conn, ["doc_001", "doc_002", "doc_003"], user_id="user_A"
         )
 
     assert result == {
@@ -193,13 +194,3 @@ def test_page_image_document_ownership(populated_db):
         assert not user_can_access_document(conn, "user_A", "doc_001", 9)
         assert not user_can_access_document(conn, "user_B", "doc_001", 1)
         assert not user_can_access_document(conn, "user_A", "doc_003", 1)
-
-
-def test_update_document_filename(populated_db):
-    update_document_filename(
-        "doc_001", "updated_biology.pdf", populated_db
-    )
-
-    document = get_document_by_hash("hash_001", populated_db)
-
-    assert document["filename"] == "updated_biology.pdf"

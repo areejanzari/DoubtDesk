@@ -1,3 +1,4 @@
+from doubtdesk.config import settings
 import sqlite3
 import hashlib
 import time
@@ -5,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 from doubtdesk.auth.security import generate_token, hash_token, hash_password
 
-DB_PATH = Path("data/auth.db")
+DB_PATH = settings.auth_db
 
 
 def initialize_auth_db(db_path: Path = DB_PATH) -> None:
@@ -63,19 +64,30 @@ def initialize_auth_db(db_path: Path = DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_login_failures_ip
             ON login_failures(ip_address, attempted_at);
+
+            CREATE TABLE IF NOT EXISTS auth_attempts (
+                action TEXT NOT NULL, ip_address TEXT NOT NULL,
+                email_hash TEXT NOT NULL, attempted_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_attempts_ip ON auth_attempts(action, ip_address, attempted_at);
+            CREATE INDEX IF NOT EXISTS idx_auth_attempts_email ON auth_attempts(action, email_hash, attempted_at);
             """
         )
+
+
+def _replace_action_token(conn, user_id, purpose, created_at):
+    token = generate_token()
+    conn.execute("DELETE FROM action_tokens WHERE user_id = ? AND purpose = ?", (user_id, purpose))
+    conn.execute("""INSERT INTO action_tokens (token_hash, user_id, purpose, expires_at, created_at)
+                     VALUES (?, ?, ?, ?, ?)""", (hash_token(token), user_id, purpose, created_at + 600, created_at))
+    return token
 
 
 def create_verification_token(
     user_id: str,
     db_path: Path = DB_PATH,
 ) -> str:
-    token = generate_token()
-    token_hash = hash_token(token)
-
     created_at = int(time.time())
-    expires_at = created_at + (10 * 60)
 
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -91,33 +103,7 @@ def create_verification_token(
         if user[0] is not None:
             raise ValueError("Email is already verified.")
 
-        conn.execute(
-            """
-            DELETE FROM action_tokens
-            WHERE user_id = ? AND purpose = 'verify'
-            """,
-            (user_id,),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO action_tokens (
-                token_hash,
-                user_id,
-                purpose,
-                expires_at,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                token_hash,
-                user_id,
-                "verify",
-                expires_at,
-                created_at,
-            ),
-        )
+        token = _replace_action_token(conn, user_id, "verify", created_at)
 
     return token
 
@@ -375,34 +361,7 @@ def create_password_reset_token(
             if current_time - latest_token[0] < 60:
                 return None
 
-        token = generate_token()
-
-        conn.execute(
-            """
-            DELETE FROM action_tokens
-            WHERE user_id = ? AND purpose = 'reset'
-            """,
-            (user_id,),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO action_tokens (
-                token_hash,
-                user_id,
-                purpose,
-                expires_at,
-                created_at
-            )
-            VALUES (?, ?, 'reset', ?, ?)
-            """,
-            (
-                hash_token(token),
-                user_id,
-                current_time + 600,
-                current_time,
-            ),
-        )
+        token = _replace_action_token(conn, user_id, "reset", current_time)
 
     return token
 
@@ -413,7 +372,6 @@ def reset_password(
     db_path: Path = DB_PATH,
 ) -> bool:
     token_hash = hash_token(token)
-    password_hash = hash_password(new_password)
     current_time = int(time.time())
 
     with closing(sqlite3.connect(db_path)) as conn, conn:
@@ -441,6 +399,7 @@ def reset_password(
             )
             return False
 
+        password_hash = hash_password(new_password)
         conn.execute(
             """
             UPDATE users
@@ -492,6 +451,29 @@ def get_login_identifier_hash(
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _login_counts(conn, identifier_hash, ip_address, cutoff):
+    identifier_count = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM login_failures
+        WHERE identifier_hash = ?
+          AND attempted_at > ?
+        """,
+        (identifier_hash, cutoff),
+    ).fetchone()[0]
+
+    ip_count = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM login_failures
+        WHERE ip_address = ?
+          AND attempted_at > ?
+        """,
+        (ip_address, cutoff),
+    ).fetchone()[0]
+    return identifier_count, ip_count
+
+
 def is_login_rate_limited(
     identifier: str,
     ip_address: str,
@@ -504,25 +486,7 @@ def is_login_rate_limited(
             conn, identifier
         )
 
-        identifier_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM login_failures
-            WHERE identifier_hash = ?
-              AND attempted_at > ?
-            """,
-            (identifier_hash, cutoff),
-        ).fetchone()[0]
-
-        ip_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM login_failures
-            WHERE ip_address = ?
-              AND attempted_at > ?
-            """,
-            (ip_address, cutoff),
-        ).fetchone()[0]
+        identifier_count, ip_count = _login_counts(conn, identifier_hash, ip_address, cutoff)
 
     return (
         identifier_count >= MAX_IDENTIFIER_FAILURES
@@ -545,25 +509,7 @@ def record_failed_login(
             conn, identifier
         )
 
-        identifier_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM login_failures
-            WHERE identifier_hash = ?
-              AND attempted_at > ?
-            """,
-            (identifier_hash, cutoff),
-        ).fetchone()[0]
-
-        ip_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM login_failures
-            WHERE ip_address = ?
-              AND attempted_at > ?
-            """,
-            (ip_address, cutoff),
-        ).fetchone()[0]
+        identifier_count, ip_count = _login_counts(conn, identifier_hash, ip_address, cutoff)
 
         if (
             identifier_count >= MAX_IDENTIFIER_FAILURES
@@ -603,6 +549,7 @@ def cleanup_expired_auth_records(
             (now,),
         ).rowcount
 
+        conn.execute("DELETE FROM auth_attempts WHERE attempted_at <= ?", (login_cutoff,))
         failures = conn.execute(
             "DELETE FROM login_failures WHERE attempted_at <= ?",
             (login_cutoff,),
@@ -613,3 +560,17 @@ def cleanup_expired_auth_records(
         "tokens_deleted": tokens,
         "failures_deleted": failures,
     }
+
+
+def consume_auth_attempt(action, ip_address, email, db_path=DB_PATH):
+    now = int(time.time())
+    cutoff = now - LOGIN_WINDOW
+    email_hash = hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
+    with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ip_count = conn.execute("SELECT COUNT(*) FROM auth_attempts WHERE action = ? AND ip_address = ? AND attempted_at > ?", (action, ip_address, cutoff)).fetchone()[0]
+        email_count = conn.execute("SELECT COUNT(*) FROM auth_attempts WHERE action = ? AND email_hash = ? AND attempted_at > ?", (action, email_hash, cutoff)).fetchone()[0]
+        if ip_count >= 20 or email_count >= 5:
+            return False
+        conn.execute("INSERT INTO auth_attempts VALUES (?, ?, ?, ?)", (action, ip_address, email_hash, now))
+    return True

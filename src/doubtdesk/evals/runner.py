@@ -1,6 +1,6 @@
+from doubtdesk.config import settings
 import asyncio
 import logging
-import os
 import sqlite3
 from contextlib import closing
 from uuid import uuid4
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 def get_evaluation_owner(doc_ids: list[str]) -> str | None:
     placeholders = ",".join("?" for _ in doc_ids)
-    with closing(sqlite3.connect("data/documents.db")) as conn:
+    with closing(sqlite3.connect(settings.documents_db)) as conn:
         row = conn.execute(f"""
             SELECT user_id FROM user_documents
             WHERE doc_id IN ({placeholders})

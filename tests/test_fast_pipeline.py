@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from doubtdesk.answering.evidence_selection import (
-    ParaphraseEvidence,
     TextEvidenceAssessment,
     assess_text_evidence,
     choose_evidence_route,
@@ -23,10 +22,7 @@ PARAPHRASES = [
 
 
 def assessment(values):
-    return TextEvidenceAssessment(scores=[
-        ParaphraseEvidence(paraphrase=question, score=score, explanation="Test")
-        for question, score in zip(PARAPHRASES, values, strict=True)
-    ])
+    return TextEvidenceAssessment(sufficiency_score=sum(values)/len(values))
 
 
 def test_assessor_uses_existing_paraphrases_in_one_llm_call():
@@ -34,7 +30,7 @@ def test_assessor_uses_existing_paraphrases_in_one_llm_call():
     client.responses.parse.return_value.output_parsed = assessment([0.9, 0.8, 1.0])
     chunks = [{"doc_id": "bio", "page_number": 2, "text": "Nephron description"}]
     result = assess_text_evidence(client, "fast-model", "Describe a nephron", PARAPHRASES, chunks)
-    assert result.scores[1].paraphrase == PARAPHRASES[1]
+    assert result.sufficiency_score == pytest.approx(0.9)
     call = client.responses.parse.call_args.kwargs
     assert call["model"] == "fast-model"
     assert call["reasoning"] == {"effort": "none"}
@@ -62,11 +58,10 @@ def test_average_route_for_three_paraphrases():
     assert choose_evidence_route(assessment([0.1, 0.3, 0.4]), PARAPHRASES, chunks)["evidence_tier"] == "low"
 
 
-def test_wrong_paraphrase_mapping_fails_closed():
+def test_paraphrase_rewording_does_not_change_route():
     chunks = [{"doc_id": "bio", "page_number": 1, "text": "nephron"}]
     result = assessment([1.0, 1.0, 1.0])
-    result.scores[1].paraphrase = "Something else"
-    assert choose_evidence_route(result, PARAPHRASES, chunks)["evidence_tier"] == "low"
+    assert choose_evidence_route(result, ["Something else", "‘Question?’", "Question."], chunks)["evidence_tier"] == "high"
 
 
 def test_six_ranked_chunks_forward_four(monkeypatch):

@@ -1,6 +1,6 @@
 import json
 from pydantic import BaseModel, Field, field_validator
-from doubtdesk.observability.tracing import observe_llm_response
+from doubtdesk.observability.tracing import observe_llm_response, trace_generation
 
 
 class ParaphraseResult(BaseModel):
@@ -40,17 +40,18 @@ def resolve_and_paraphrase(
         "Do not invent missing information or answer the question."
     )
 
-    response = client.responses.parse(
-        model=model_name,
-        input=[
-            {"role": "system", "content": instruction},
-            {"role": "user", "content": json.dumps({"history": history, "current_question": question})},
-        ],
-        text_format=ContextualParaphraseResult,
-        reasoning={"effort": "none"},
-        max_output_tokens=650,
-    )
-    observe_llm_response("paraphrasing", response, model_name, request_id, conversation_id)
+    with trace_generation("paraphrasing", model_name, request_id, input={"question": question, "history_count": len(history)}):
+        response = client.responses.parse(
+            model=model_name,
+            input=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": json.dumps({"history": history, "current_question": question})},
+            ],
+            text_format=ContextualParaphraseResult,
+            reasoning={"effort": "none"},
+            max_output_tokens=650,
+        )
+        observe_llm_response("paraphrasing", response, model_name, request_id, conversation_id)
     if response.output_parsed is None:
         raise ValueError("Model returned no valid paraphrases")
     return ContextualParaphraseResult.model_validate(response.output_parsed)

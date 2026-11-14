@@ -1,3 +1,4 @@
+from doubtdesk.config import settings
 from pathlib import Path
 from langgraph.graph import StateGraph, START, END
 from doubtdesk.graph.state import DoubtDeskState
@@ -31,7 +32,7 @@ def build_graph(
     client,
     model_name: str,
     scope_classifier,
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
     memory_collection=None,
     output_judge=None,
     paraphrase_model_name=None,
@@ -43,7 +44,7 @@ def build_graph(
     workflow.add_node("reject", rejection_node)
     workflow.add_node("retrieve", retrieve_node(collection, embedding_model, db_path))
     workflow.add_node("select_evidence", evidence_selection_node(client, assessment_model_name or model_name))
-    workflow.add_node("evidence", evidence_node(client, model_name))
+    workflow.add_node("evidence", evidence_node(client, model_name, output_judge))
     workflow.add_node("fallback", fallback_node(client, model_name))
     workflow.add_node("grounded", grounded_node)
     workflow.add_node("insufficient_document", insufficient_document_node)
@@ -83,7 +84,7 @@ def build_graph(
 
 def build_preparation_graph(
     collection, embedding_model, client, model_name, scope_classifier,
-    db_path=Path("data/documents.db"), memory_collection=None,
+    db_path=settings.documents_db, memory_collection=None,
     paraphrase_model_name=None, assessment_model_name=None,
 ):
     workflow = StateGraph(DoubtDeskState)

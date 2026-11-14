@@ -21,6 +21,9 @@ def get_usage_overview(
             f"""
             SELECT
                 COUNT(*) AS gemini_calls,
+                COUNT(*) AS model_calls,
+                COALESCE(SUM(CASE WHEN provider = 'gemini' AND operation = 'output_judge' THEN 1 ELSE 0 END), 0) AS gemini_judge_calls,
+                COALESCE(SUM(pacer_wait_ms), 0) AS judge_wait_ms,
                 COUNT(DISTINCT request_id) AS total_requests,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)
                     AS successful_calls,
@@ -124,6 +127,9 @@ def get_request_usage(
                 request_id,
                 MAX(conversation_id) AS conversation_id,
                 COUNT(*) AS gemini_calls,
+                COUNT(*) AS model_calls,
+                COALESCE(SUM(CASE WHEN provider = 'gemini' AND operation = 'output_judge' THEN 1 ELSE 0 END), 0) AS gemini_judge_calls,
+                COALESCE(SUM(pacer_wait_ms), 0) AS judge_wait_ms,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)
                     AS successful_calls,
                 SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END)
@@ -132,6 +138,7 @@ def get_request_usage(
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 COALESCE(SUM(total_tokens), 0) AS total_tokens,
                 COALESCE(SUM(latency_ms), 0) AS gemini_latency_ms,
+                COALESCE(SUM(latency_ms), 0) AS model_latency_ms,
                 GROUP_CONCAT(DISTINCT operation) AS operations,
                 MAX(created_at) AS created_at,
                 MAX(id) AS last_record_id

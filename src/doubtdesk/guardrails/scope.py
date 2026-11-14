@@ -26,36 +26,36 @@ class ScopeClassifier:
         )
 
     def predict(self, questions: list[str]) -> list[dict]:
+        if not questions:
+            return []
+        model_inputs = self.session.get_inputs()
+        shapes = [item.shape for item in model_inputs[:2]]
+        fixed_batches = {shape[0] for shape in shapes if isinstance(shape[0], int) and shape[0] > 0}
+        fixed_lengths = {shape[1] for shape in shapes if isinstance(shape[1], int) and shape[1] > 0}
+        if len(fixed_batches) > 1 or len(fixed_lengths) > 1:
+            raise RuntimeError("Inconsistent ONNX input shapes")
+        fixed_batch = next(iter(fixed_batches), None)
+        batch_size = fixed_batch or len(questions)
+        fixed_length = next(iter(fixed_lengths), None)
         predictions = []
-
-        for question in questions:
+        for start in range(0, len(questions), batch_size):
+            batch = questions[start:start+batch_size]
+            padded = batch + [batch[-1]] * (batch_size-len(batch)) if fixed_batch else batch
             encoded = self.tokenizer(
-                SYSTEM,
-                question,
-                return_tensors="np",
-                truncation=True,
-                padding="max_length",
-                max_length=512,
+                [SYSTEM] * len(padded), padded, return_tensors="np", truncation=True,
+                padding="max_length" if fixed_length else True, max_length=fixed_length or 512,
                 return_token_type_ids=False,
             )
-
-            model_inputs = self.session.get_inputs()
-
             inputs = {
                 model_inputs[0].name: encoded["input_ids"].astype(np.int64),
                 model_inputs[1].name: encoded["attention_mask"].astype(np.int64),
             }
-
-            logits = self.session.run(None, inputs)[0][0]
-            shifted = logits - np.max(logits)
-            probabilities = np.exp(shifted) / np.exp(shifted).sum()
-
-            predictions.append({
-                "question": question,
-                "label": int(np.argmax(probabilities)),
-                "off_topic_probability": round(float(probabilities[1]), 4),
-            })
-
+            logits_batch = self.session.run(None, inputs)[0]
+            for question, logits in zip(batch, logits_batch):
+                shifted = logits - np.max(logits)
+                probabilities = np.exp(shifted) / np.exp(shifted).sum()
+                predictions.append({"question": question, "label": int(np.argmax(probabilities)),
+                                    "off_topic_probability": round(float(probabilities[1]), 4)})
         return predictions
 
 

@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from doubtdesk.api.streaming import stream_answer, stream_general, stream_grounded
+from doubtdesk.api.streaming import stream_answer
 from doubtdesk.answering.output_guardrails import JudgeVerdict
 
 
@@ -153,7 +153,7 @@ def test_stream_gemini_http_503_yields_truthful_verification_failure():
 
 def test_stream_rejected_grounded_uses_vetted_general_fallback():
     import json
-    grounded_json = json.dumps({"status": "sufficient", "answer": "UNVERIFIED PDF CLAIM", "sources": [{"doc_id": "docA", "page_numbers": [1]}]})
+    grounded_json = json.dumps({"status": "sufficient", "answer": "UNVERIFIED PDF CLAIM", "sources": ["S1"]})
     openai = FakeOpenAI(grounded_json)
     judge = FakeJudge([verdict(False), verdict(False), verdict(True)])
     prepared = {

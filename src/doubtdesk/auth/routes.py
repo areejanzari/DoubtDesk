@@ -1,8 +1,6 @@
 import os
-import secrets
 import logging
 import smtplib
-from dotenv import load_dotenv
 from fastapi import (
     APIRouter,
     HTTPException, 
@@ -10,7 +8,6 @@ from fastapi import (
     Request,
     Response,
     Depends,
-    Header,
 )
 from doubtdesk.auth.mailer import send_verification_email, send_password_reset_email
 from doubtdesk.auth.schemas import (
@@ -24,7 +21,7 @@ from doubtdesk.auth.schemas import (
     ResetPasswordRequest,
 )
 from doubtdesk.auth.service import register_user, authenticate_user
-from doubtdesk.auth.dependencies import require_current_user
+from doubtdesk.auth.dependencies import require_current_user, get_client_ip
 from doubtdesk.auth.store import (
     create_verification_token,
     verify_email_token,
@@ -35,12 +32,16 @@ from doubtdesk.auth.store import (
     reset_password,
     is_login_rate_limited,
     record_failed_login,
+    consume_auth_attempt,
 )
-
-load_dotenv()
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
+
+
+def _limit_auth_action(action, request, email):
+    if not consume_auth_attempt(action, get_client_ip(request), email):
+        raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
 
 
 @router.post(
@@ -48,7 +49,8 @@ logger = logging.getLogger(__name__)
     response_model=SignupResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def signup(payload: SignupRequest):
+def signup(payload: SignupRequest, request: Request):
+    _limit_auth_action("signup", request, str(payload.email))
     try:
         user = register_user(payload)
     except ValueError as exc:
@@ -88,7 +90,8 @@ def verify_email(payload: VerifyEmailRequest):
 
 
 @router.post("/resend-verification")
-def resend_verification(payload: ResendVerificationRequest):
+def resend_verification(payload: ResendVerificationRequest, request: Request):
+    _limit_auth_action("resend-verification", request, str(payload.email))
     message = {
         "message": (
             "If this email belongs to an unverified account "
@@ -121,7 +124,7 @@ def login(
     response: Response,
 ):
     identifier = payload.identifier.strip()
-    ip_address = request.client.host if request.client else "unknown"
+    ip_address = get_client_ip(request)
 
     if is_login_rate_limited(identifier, ip_address):
         raise HTTPException(
@@ -192,7 +195,8 @@ def logout(
     return {"message": "Logged out successfully."}
 
 @router.post("/forgot-password")
-def forgot_password(payload: ForgotPasswordRequest):
+def forgot_password(payload: ForgotPasswordRequest, request: Request):
+    _limit_auth_action("forgot-password", request, str(payload.email))
     message = {
         "message": (
             "If the email belongs to a verified account, "

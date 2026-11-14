@@ -9,7 +9,6 @@ from doubtdesk.retrieval.lexical_store import (
 )
 from doubtdesk.answering.evidence_selection import (
     TextEvidenceAssessment,
-    ParaphraseEvidence,
     EvidencePage,
     choose_evidence_route,
 )
@@ -73,7 +72,7 @@ def test_backfill_existing_document_only_once(tmp_path):
 def test_text_sufficient_uses_no_images():
     chunks = [{"doc_id": "doc", "page_number": 4, "text": "Water boils", "chunk_id": "c1"}]
     assessment = TextEvidenceAssessment(
-        scores=[ParaphraseEvidence(paraphrase="Explain boiling", score=0.96, explanation="Clear")]
+        sufficiency_score=0.96
     )
     choice = choose_evidence_route(assessment, ["Explain boiling"], chunks, threshold=0.80)
     assert choice["evidence_mode"] == "text"
@@ -88,7 +87,7 @@ def test_moderate_score_selects_at_most_two_images_and_ignores_wrong_doc():
         for i in range(1, 5)
     ]
     assessment = TextEvidenceAssessment(
-        scores=[ParaphraseEvidence(paraphrase="Explain equation", score=0.55, explanation="Partial")],
+        sufficiency_score=0.55,
         recommended_image_pages=[
             EvidencePage(doc_id="other", page_number=1),
             EvidencePage(doc_id="doc", page_number=3),
@@ -104,10 +103,10 @@ def test_moderate_score_selects_at_most_two_images_and_ignores_wrong_doc():
     ]
 
 
-def test_mismatched_requirements_cannot_pass_text_route():
+def test_assessment_score_without_chunks_cannot_pass_text_route():
     chunks = [{"doc_id": "doc", "page_number": 1, "text": "Fact"}]
     assessment = TextEvidenceAssessment(
-        scores=[ParaphraseEvidence(paraphrase="Wrong requirement", score=1.0, explanation="Incorrect")]
+        sufficiency_score=1.0
     )
-    choice = choose_evidence_route(assessment, ["Expected requirement"], chunks, threshold=0.80)
+    choice = choose_evidence_route(assessment, ["Expected requirement"], [], threshold=0.80)
     assert choice["evidence_mode"] == "low"

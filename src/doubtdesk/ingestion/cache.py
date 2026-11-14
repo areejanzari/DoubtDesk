@@ -1,4 +1,4 @@
-from pathlib import Path
+from doubtdesk.config import settings
 from chromadb.api.models.Collection import Collection
 
 def cached_artifacts_exist(
@@ -9,7 +9,7 @@ def cached_artifacts_exist(
     if page_count <= 0:
         return False
 
-    image_dir = Path("data/page_images") / doc_id
+    image_dir = settings.page_image_dir / doc_id
 
     for page_number in range(1, page_count + 1):
         image_path = image_dir / f"page_{page_number:03}.png"

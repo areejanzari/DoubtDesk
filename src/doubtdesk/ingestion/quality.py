@@ -3,16 +3,6 @@ import pymupdf
 def count_characters(text: str) -> int:
     return len(text.strip())
 
-def alphabetic_ratio(text: str) -> float:
-    characters = [char for char in text if not char.isspace()]
-
-    if not characters:
-        return 0.0
-
-    alphabetic_count = sum(char.isalpha() for char in characters)
-
-    return alphabetic_count/len(characters)
-
 def garbage_character_ratio(text: str) -> float:
     characters = [char for char in text if not char.isspace()]
 

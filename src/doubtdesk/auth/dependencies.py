@@ -1,4 +1,6 @@
+from doubtdesk.config import runtime_settings
 import os
+from ipaddress import ip_address
 import secrets
 from fastapi import Header, HTTPException, Request, status
 from doubtdesk.auth.store import get_session
@@ -65,3 +67,17 @@ def allowed_origins() -> set[str]:
         "http://localhost:8000",
         "http://127.0.0.1:8000",
     }
+
+
+def get_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    count = runtime_settings().trusted_proxy_count
+    if count <= 0:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")
+    if len(forwarded) < count:
+        return peer
+    try:
+        return str(ip_address(forwarded[-count].strip()))
+    except ValueError:
+        return peer

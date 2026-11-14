@@ -1,7 +1,8 @@
+from doubtdesk.config import settings
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("data/analytics.db")
+DB_PATH = settings.analytics_db
 
 
 def initialize_analytics_db(db_path: Path = DB_PATH) -> None:
@@ -28,6 +29,14 @@ def initialize_analytics_db(db_path: Path = DB_PATH) -> None:
             )
             """
         )
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(ai_usage)")}
+        if "provider" not in columns:
+            conn.execute("ALTER TABLE ai_usage ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown'")
+            conn.execute("UPDATE ai_usage SET provider = 'gemini' WHERE lower(model) LIKE 'gemini%'")
+            conn.execute("UPDATE ai_usage SET provider = 'openai' WHERE lower(model) LIKE 'gpt-%'")
+        if "pacer_wait_ms" not in columns:
+            conn.execute("ALTER TABLE ai_usage ADD COLUMN pacer_wait_ms INTEGER")
 
         conn.execute(
             """
