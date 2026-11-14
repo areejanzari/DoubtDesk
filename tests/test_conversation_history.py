@@ -1,9 +1,7 @@
-import json
 import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 from uuid import uuid4
 from unittest.mock import MagicMock
 
@@ -146,116 +144,75 @@ def test_migration_preserves_old_exchanges_and_creates_title(tmp_path):
 def test_api_routes_ownership_limit_crud(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     initialize_memory_db(Path("data/conversations.db"))
-    import doubtdesk.auth.dependencies as dependencies
-    previous_vector = sys.modules.get("doubtdesk.memory.vector")
-    stub_vector = ModuleType("doubtdesk.memory.vector")
-    stub_vector.delete_session_memories = MagicMock()
-    sys.modules["doubtdesk.memory.vector"] = stub_vector
-    previous_conversation_routes = sys.modules.pop("doubtdesk.conversations.routes", None)
-    from doubtdesk.conversations.routes import router
+    from doubtdesk.auth.dependencies import require_current_user
+    from doubtdesk.conversations import routes
+    delete_memories = MagicMock()
+    monkeypatch.setattr(routes, "delete_session_memories", delete_memories)
 
     user = {"user_id": "alice"}
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(routes.router)
     app.state.memory_collection = MagicMock()
-    app.dependency_overrides[dependencies.require_current_user] = lambda: user
-    try:
-        with TestClient(app) as client:
-            assert client.get("/conversations").json() == []
-            created = client.post("/conversations")
-            assert created.status_code == 201
-            conversation_id = created.json()["conversation_id"]
-            assert created.json()["title"] == "New chat"
-            assert client.get(f"/conversations/{conversation_id}").status_code == 200
-            renamed = client.patch(f"/conversations/{conversation_id}", json={"title": "Biology Q&A"})
-            assert renamed.status_code == 200
-            assert renamed.json()["title"] == "Biology Q&A"
-            user["user_id"] = "bob"
-            assert client.get(f"/conversations/{conversation_id}").status_code == 404
-            assert client.patch(f"/conversations/{conversation_id}", json={"title": "Hijack"}).status_code == 404
-            assert client.delete(f"/conversations/{conversation_id}").status_code == 404
-            user["user_id"] = "alice"
-            for _ in range(29):
-                assert client.post("/conversations").status_code == 201
-            assert client.post("/conversations").status_code == 409
-            assert len(client.get("/conversations").json()) == 30
-            assert client.delete(f"/conversations/{conversation_id}").status_code == 204
-            stub_vector.delete_session_memories.assert_called_once()
+    app.dependency_overrides[require_current_user] = lambda: user
+    with TestClient(app) as client:
+        assert client.get("/conversations").json() == []
+        created = client.post("/conversations")
+        assert created.status_code == 201
+        conversation_id = created.json()["conversation_id"]
+        assert created.json()["title"] == "New chat"
+        assert client.get(f"/conversations/{conversation_id}").status_code == 200
+        renamed = client.patch(f"/conversations/{conversation_id}", json={"title": "Biology Q&A"})
+        assert renamed.status_code == 200
+        assert renamed.json()["title"] == "Biology Q&A"
+        user["user_id"] = "bob"
+        assert client.get(f"/conversations/{conversation_id}").status_code == 404
+        assert client.patch(f"/conversations/{conversation_id}", json={"title": "Hijack"}).status_code == 404
+        assert client.delete(f"/conversations/{conversation_id}").status_code == 404
+        user["user_id"] = "alice"
+        for _ in range(29):
             assert client.post("/conversations").status_code == 201
-    finally:
-        sys.modules.pop("doubtdesk.conversations.routes", None)
-        if previous_conversation_routes is not None:
-            sys.modules["doubtdesk.conversations.routes"] = previous_conversation_routes
-        if previous_vector is None:
-            sys.modules.pop("doubtdesk.memory.vector", None)
-        else:
-            sys.modules["doubtdesk.memory.vector"] = previous_vector
+        assert client.post("/conversations").status_code == 409
+        assert len(client.get("/conversations").json()) == 30
+        assert client.delete(f"/conversations/{conversation_id}").status_code == 204
+        delete_memories.assert_called_once()
+        assert client.post("/conversations").status_code == 201
 
 
 def test_ask_and_stream_reject_31st_before_model_calls(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     initialize_memory_db(Path("data/conversations.db"))
     from doubtdesk.ingestion.registry import initialize_registry
+    from doubtdesk.auth.dependencies import require_current_user
+    from doubtdesk.api import routes
     initialize_registry(Path("data/documents.db"))
     for _ in range(30):
         claim_or_check_conversation(str(uuid4()), "alice")
 
-    fake_ingestion = ModuleType("doubtdesk.ingestion.service")
-    fake_ingestion.process_pdf = MagicMock()
-    fake_memory = ModuleType("doubtdesk.memory.vector")
-    fake_memory.add_exchange_memory = MagicMock()
-    fake_stream = ModuleType("doubtdesk.api.streaming")
-    fake_stream.sse = lambda name, obj: f"event: {name}\ndata: {json.dumps(obj)}\n\n"
-    fake_stream.stream_answer = MagicMock()
-    fake_stream.finalize_stream_result = MagicMock()
-    names = {
-        "doubtdesk.ingestion.service": fake_ingestion,
-        "doubtdesk.memory.vector": fake_memory,
-        "doubtdesk.api.streaming": fake_stream,
-    }
-    saved = {name: sys.modules.get(name) for name in names}
-    previous_api_routes = sys.modules.get("doubtdesk.api.routes")
-    try:
-        sys.modules.update(names)
-        sys.modules.pop("doubtdesk.api.routes", None)
-        from doubtdesk.api.routes import router
-        import doubtdesk.auth.dependencies as deps
-        app = FastAPI()
-        app.include_router(router)
-        app.state.graph = MagicMock()
-        app.state.preparation_graph = MagicMock()
-        app.dependency_overrides[deps.require_current_user] = lambda: {"user_id": "alice"}
-        with TestClient(app) as client:
-            payload = {"question": "What is a nephron?", "doc_ids": []}
-            for endpoint in ["/ask", "/ask/stream"]:
-                response = client.post(endpoint, json=payload)
-                assert response.status_code == 409
-                assert "30-conversation limit" in response.json()["detail"]
-            app.state.graph.invoke.assert_not_called()
-            app.state.preparation_graph.invoke.assert_not_called()
-    finally:
-        sys.modules.pop("doubtdesk.api.routes", None)
-        if previous_api_routes is not None:
-            sys.modules["doubtdesk.api.routes"] = previous_api_routes
-        for name, value in saved.items():
-            if value is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = value
+    stream = MagicMock()
+    monkeypatch.setattr(routes, "stream_answer", stream)
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.state.graph = MagicMock()
+    app.state.preparation_graph = MagicMock()
+    app.dependency_overrides[require_current_user] = lambda: {"user_id": "alice"}
+    with TestClient(app) as client:
+        payload = {"question": "What is a nephron?", "doc_ids": []}
+        for endpoint in ["/ask", "/ask/stream"]:
+            response = client.post(endpoint, json=payload)
+            assert response.status_code == 409
+            assert "30-conversation limit" in response.json()["detail"]
+        app.state.graph.invoke.assert_not_called()
+        app.state.preparation_graph.invoke.assert_not_called()
+    stream.assert_not_called()
 
 
 def test_completed_ask_and_stream_save_history(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     initialize_memory_db(Path("data/conversations.db"))
     from doubtdesk.ingestion.registry import initialize_registry
+    from doubtdesk.auth.dependencies import require_current_user
+    from doubtdesk.api import routes
     initialize_registry(Path("data/documents.db"))
-
-    fake_ingestion = ModuleType("doubtdesk.ingestion.service")
-    fake_ingestion.process_pdf = MagicMock()
-    fake_memory = ModuleType("doubtdesk.memory.vector")
-    fake_memory.add_exchange_memory = MagicMock()
-    fake_stream = ModuleType("doubtdesk.api.streaming")
-    fake_stream.sse = lambda name, obj: f"event: {name}\ndata: {json.dumps(obj)}\n\n"
 
     def stream_answer(*args, **kwargs):
         yield ("token", {"text": "The answer"})
@@ -265,66 +222,60 @@ def test_completed_ask_and_stream_save_history(tmp_path, monkeypatch):
             "sources": [{"doc_id": "pdf", "page_numbers": [2]}],
         }
 
-    fake_stream.stream_answer = stream_answer
-    fake_stream.finalize_stream_result = lambda result: {
+    monkeypatch.setattr(routes, "add_exchange_memory", MagicMock())
+    monkeypatch.setattr(routes, "stream_answer", stream_answer)
+    monkeypatch.setattr(routes, "finalize_stream_result", lambda result, **kwargs: {
         **result,
         "formatted_answer": "The answer\n\nSources:\n- biology.pdf: PDF page(s) 2",
+    })
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.state.graph = MagicMock()
+    app.state.graph.invoke.return_value = {
+        "status": "general_knowledge",
+        "answer": "Gravity explanation",
+        "sources": [],
+        "formatted_answer": "Gravity explanation\n\nNot from document.",
     }
-    stub_names = {
-        "doubtdesk.ingestion.service": fake_ingestion,
-        "doubtdesk.memory.vector": fake_memory,
-        "doubtdesk.api.streaming": fake_stream,
-    }
-    saved = {name: sys.modules.get(name) for name in stub_names}
-    previous_api_routes = sys.modules.get("doubtdesk.api.routes")
-    try:
-        sys.modules.update(stub_names)
-        sys.modules.pop("doubtdesk.api.routes", None)
-        from doubtdesk.api.routes import router
-        import doubtdesk.auth.dependencies as deps
-        app = FastAPI()
-        app.include_router(router)
-        app.state.graph = MagicMock()
-        app.state.graph.invoke.return_value = {
-            "status": "general_knowledge",
-            "answer": "Gravity explanation",
-            "sources": [],
-            "formatted_answer": "Gravity explanation\n\nNot from document.",
-        }
-        app.state.preparation_graph = MagicMock()
-        app.state.preparation_graph.invoke.return_value = {"question": "A biology question"}
-        app.state.llm_client = MagicMock()
-        app.state.model_name = "fake-model"
-        app.state.output_judge = MagicMock()
-        app.state.embedding_model = MagicMock()
-        app.state.memory_collection = MagicMock()
-        app.dependency_overrides[deps.require_current_user] = lambda: {"user_id": "alice"}
-        with TestClient(app) as client:
-            first = client.post("/ask", json={"question": "Explain gravity", "doc_ids": []})
-            assert first.status_code == 200
-            cid = first.json()["conversation_id"]
-            detail = get_user_conversation(cid, "alice")
-            assert detail["title"] == "Explain gravity"
-            assert detail["messages"][0]["formatted_answer"].endswith("Not from document.")
+    app.state.preparation_graph = MagicMock()
+    app.state.preparation_graph.invoke.return_value = {"question": "A biology question"}
+    app.state.llm_client = MagicMock()
+    app.state.model_name = "fake-model"
+    app.state.output_judge = MagicMock()
+    app.state.embedding_model = MagicMock()
+    app.state.memory_collection = MagicMock()
+    app.dependency_overrides[require_current_user] = lambda: {"user_id": "alice"}
+    with TestClient(app) as client:
+        first = client.post("/ask", json={"question": "Explain gravity", "doc_ids": []})
+        assert first.status_code == 200
+        cid = first.json()["conversation_id"]
+        detail = get_user_conversation(cid, "alice")
+        assert detail["title"] == "Explain gravity"
+        assert detail["messages"][0]["formatted_answer"].endswith("Not from document.")
 
-            stream = client.post(
-                "/ask/stream",
-                json={"question": "A biology question", "doc_ids": [], "conversation_id": cid},
-            )
-            assert stream.status_code == 200
-            assert "event: complete" in stream.text
-            detail = get_user_conversation(cid, "alice")
-            assert [item["question"] for item in detail["messages"]] == [
-                "Explain gravity", "A biology question"
-            ]
-            assert detail["messages"][1]["sources"] == [{"doc_id": "pdf", "page_numbers": [2]}]
-            assert detail["title"] == "Explain gravity"
-    finally:
-        sys.modules.pop("doubtdesk.api.routes", None)
-        if previous_api_routes is not None:
-            sys.modules["doubtdesk.api.routes"] = previous_api_routes
-        for name, value in saved.items():
-            if value is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = value
+        stream = client.post(
+            "/ask/stream",
+            json={"question": "A biology question", "doc_ids": [], "conversation_id": cid},
+        )
+        assert stream.status_code == 200
+        assert "event: complete" in stream.text
+        detail = get_user_conversation(cid, "alice")
+        assert [item["question"] for item in detail["messages"]] == [
+            "Explain gravity", "A biology question"
+        ]
+        assert detail["messages"][1]["sources"] == [{"doc_id": "pdf", "page_numbers": [2]}]
+        assert detail["title"] == "Explain gravity"
+
+
+def test_router_modules_remain_canonical():
+    from doubtdesk.api import routes, streaming
+    from doubtdesk.conversations import routes as conversation_routes
+    from doubtdesk.memory import vector
+
+    assert routes is sys.modules["doubtdesk.api.routes"]
+    assert streaming is sys.modules["doubtdesk.api.streaming"]
+    assert conversation_routes is sys.modules["doubtdesk.conversations.routes"]
+    assert vector is sys.modules["doubtdesk.memory.vector"]
+    assert routes.stream_answer is streaming.stream_answer
+    assert routes.finalize_stream_result is streaming.finalize_stream_result
+    assert conversation_routes.delete_session_memories is vector.delete_session_memories

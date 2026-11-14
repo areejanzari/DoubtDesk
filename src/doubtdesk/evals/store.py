@@ -1,9 +1,10 @@
+from doubtdesk.config import settings
 import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-DB_PATH = Path("data/evals.db")
+DB_PATH = settings.evals_db
 
 
 def initialize_evals_db(db_path: Path = DB_PATH):

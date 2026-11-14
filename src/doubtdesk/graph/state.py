@@ -12,6 +12,7 @@ class DoubtDeskState(TypedDict, total=False):
     evidence_pages: list[dict]
     evidence_mode: str
     evidence_assessment: object
+    candidate_error: str
     evidence: EvidenceResult
     status: str
     answer: str
@@ -25,6 +26,7 @@ class DoubtDeskState(TypedDict, total=False):
     request_id: str
     
     evidence_tier: str
+    document_insufficient: bool
     skip_output_judge: bool
     judge_passed: bool
     judge_attempts: int

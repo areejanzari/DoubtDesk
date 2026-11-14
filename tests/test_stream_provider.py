@@ -1,6 +1,5 @@
 import json
 from types import SimpleNamespace
-from doubtdesk.api.stream_parser import IncrementalEvidenceAnswer
 from doubtdesk.api.streaming import sse, stream_general, stream_answer, stream_grounded
 
 
@@ -45,21 +44,6 @@ def collect_generator(generator):
             return events, complete.value
 
 
-def test_json_stream_emits_only_sufficient_answer():
-    answer = 'Hello, "student".\nα'
-    raw = json.dumps({"status": "sufficient", "answer": answer, "sources": []})
-    parser = IncrementalEvidenceAnswer()
-    output = []
-    for pos in range(0, len(raw), 2):
-        output.append(parser.feed(raw[pos:pos + 2]))
-    assert "".join(output) == answer
-
-
-def test_insufficient_stream_does_not_leak_answer():
-    parser = IncrementalEvidenceAnswer()
-    assert parser.feed('{"status":"insufficient","answer":"should not appear","sources":[]}') == ""
-
-
 def test_general_stream_does_not_add_model_call():
     client = FakeClient("An answer")
     events, result = collect_generator(stream_general(client, "gpt-6-luna", "What is gravity?"))
@@ -72,10 +56,10 @@ def test_grounded_stream_validates_sources(tmp_path):
     image = tmp_path / "page.png"
     image.write_bytes(b"fake png bytes")
     page = {"doc_id": "document", "page_number": 2, "image_path": image}
-    raw = json.dumps({"status": "sufficient", "answer": "Valid result", "sources": [{"doc_id": "document", "page_numbers": [2]}]})
+    raw = json.dumps({"status": "sufficient", "answer": "Valid result", "sources": ["S1"]})
     client = FakeClient(raw)
-    events, result = collect_generator(stream_grounded(client, "gpt-6-luna", "Question?", [page]))
-    assert "".join(item[1]["text"] for item in events) == "Valid result"
+    result = stream_grounded(client, "gpt-6-luna", "Question?", [page])
+    assert result["answer"] == "Valid result"
     assert result["sources"] == [{"doc_id": "document", "page_numbers": [2]}]
     assert client.calls == 1
 
@@ -88,7 +72,7 @@ def test_text_grounded_stream_does_not_send_images():
     raw = json.dumps({
         "status": "sufficient",
         "answer": "Light converts into chemical energy.",
-        "sources": [{"doc_id": "biology", "page_numbers": [1]}],
+        "sources": ["S1"],
     })
     client = FakeClient(raw)
     prepared = {
@@ -114,7 +98,7 @@ def test_visual_grounded_stream_includes_selected_image(tmp_path):
     raw = json.dumps({
         "status": "sufficient",
         "answer": "The equation is supported by page 1.",
-        "sources": [{"doc_id": "physics", "page_numbers": [1]}],
+        "sources": ["S1"],
     })
     client = FakeClient(raw)
     prepared = {

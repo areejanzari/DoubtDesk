@@ -35,15 +35,12 @@ def service_mocks():
             return_value="hash_001",
         ),
         patch(
-            "doubtdesk.ingestion.service.get_collection",
-            return_value=MagicMock(),
-        ),
-        patch(
             "doubtdesk.ingestion.service.get_document_by_hash",
             return_value=None,
         ) as get_document,
         patch(
-            "doubtdesk.ingestion.service.register_document"
+            "doubtdesk.ingestion.service.claim_document_ingestion",
+            side_effect=lambda doc_id, *args, **kwargs: {"doc_id": doc_id, "status": "processing"},
         ) as register,
         patch(
             "doubtdesk.ingestion.service.attach_document_to_user"
@@ -59,7 +56,6 @@ def service_mocks():
             "doubtdesk.ingestion.service.chunk_document",
             return_value=["chunk1"],
         ),
-        patch("doubtdesk.ingestion.service.load_embedding_model"),
         patch(
             "doubtdesk.ingestion.service.embed_chunks",
             return_value=[[0.1, 0.2]],
@@ -147,7 +143,7 @@ def test_ingest_document(sample_pdf, tmp_path, monkeypatch):
     )
 
 def test_successful_ingestion(service_mocks):
-    result = process_pdf(Path("biology.pdf"), user_id="user_A")
+    result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
 
     assert result["status"] == "completed"
     assert result["page_count"] == 2
@@ -161,9 +157,6 @@ def test_successful_ingestion(service_mocks):
     )
 
     service_mocks["update_status"].assert_any_call(
-        result["doc_id"], "processing", 0
-    )
-    service_mocks["update_status"].assert_any_call(
         result["doc_id"], "completed", 2
     )
 
@@ -175,19 +168,16 @@ def test_cached_document(service_mocks):
     service_mocks["get_document"].return_value = {
         "doc_id": "doc_001",
         "page_count": 8,
+        "status": "completed",
     }
 
     with (
-        patch(
-            "doubtdesk.ingestion.service.is_document_cached",
-            return_value=True,
-        ),
         patch(
             "doubtdesk.ingestion.service.cached_artifacts_exist",
             return_value=True,
         ),
     ):
-        result = process_pdf(Path("biology.pdf"), user_id="user_A")
+        result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
 
     assert result == {
         "doc_id": "doc_001",
@@ -210,9 +200,9 @@ def test_ingestion_failure(service_mocks):
     )
 
     with pytest.raises(RuntimeError, match="PDF extraction failed"):
-        process_pdf(Path("biology.pdf"), user_id="user_A")
+        process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
 
-    doc_id = service_mocks["register"].call_args.kwargs["doc_id"]
+    doc_id = service_mocks["register"].call_args.args[0]
 
     service_mocks["update_status"].assert_any_call(
         doc_id, "failed", 0
@@ -227,7 +217,7 @@ def test_empty_chunks(service_mocks):
         "doubtdesk.ingestion.service.chunk_document",
         return_value=[],
     ):
-        result = process_pdf(Path("biology.pdf"), user_id="user_A")
+        result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
 
     assert result["status"] == "completed"
     service_mocks["delete_chunks"].assert_called_once()
@@ -316,8 +306,6 @@ def test_reuses_provided_embedding_model(service_mocks):
     collection = MagicMock()
 
     with (
-        patch("doubtdesk.ingestion.service.load_embedding_model") as load_model,
-        patch("doubtdesk.ingestion.service.get_collection") as get_collection,
         patch("doubtdesk.ingestion.service.embed_chunks") as embed,
     ):
         result = process_pdf(
@@ -328,6 +316,4 @@ def test_reuses_provided_embedding_model(service_mocks):
         )
 
     assert result["status"] == "completed"
-    load_model.assert_not_called()
-    get_collection.assert_not_called()
     embed.assert_called_once_with(["chunk1"], model)

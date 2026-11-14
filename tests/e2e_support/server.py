@@ -1,3 +1,4 @@
+import chromadb
 import os
 import sqlite3
 import tempfile
@@ -14,7 +15,8 @@ from doubtdesk.auth.routes import router as auth_router
 from doubtdesk.auth.schemas import SignupRequest
 from doubtdesk.auth.service import register_user
 from doubtdesk.auth.store import initialize_auth_db
-from doubtdesk.graph.builder import build_graph, build_preparation_graph
+from doubtdesk.graph.builder import build_preparation_graph
+from doubtdesk.api.streaming import PreparedAnswerGraph
 from doubtdesk.ingestion.embeddings import load_embedding_model
 from doubtdesk.ingestion.registry import initialize_registry
 from doubtdesk.memory.store import initialize_memory_db
@@ -65,21 +67,13 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.embedding_model = load_embedding_model()
-    app.state.collection = get_collection()
+    app.state.chroma_client = chromadb.PersistentClient(path="data/chroma")
+    app.state.collection = get_collection(client=app.state.chroma_client)
     app.state.llm_client = FakeOpenAIClient()
     app.state.output_judge = FakeOutputJudge()
     app.state.model_name = "fake-openai"
-    app.state.memory_collection = get_memory_collection()
+    app.state.memory_collection = get_memory_collection(client=app.state.chroma_client)
     app.state.scope_classifier = FakeScopeClassifier()
-    app.state.graph = build_graph(
-        collection=app.state.collection,
-        embedding_model=app.state.embedding_model,
-        client=app.state.llm_client,
-        model_name=app.state.model_name,
-        scope_classifier=app.state.scope_classifier,
-        memory_collection=app.state.memory_collection,
-        output_judge=app.state.output_judge,
-    )
     app.state.preparation_graph = build_preparation_graph(
         collection=app.state.collection,
         embedding_model=app.state.embedding_model,
@@ -88,6 +82,8 @@ async def lifespan(app: FastAPI):
         scope_classifier=app.state.scope_classifier,
         memory_collection=app.state.memory_collection,
     )
+    app.state.graph = PreparedAnswerGraph(app.state.preparation_graph, app.state.llm_client,
+                                          app.state.model_name, app.state.output_judge)
 
     try:
         yield

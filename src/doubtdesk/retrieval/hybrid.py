@@ -1,4 +1,4 @@
-import os
+from doubtdesk.config import runtime_settings
 from collections import defaultdict
 from doubtdesk.retrieval.search import embed_queries, format_search_results, search_chunks
 from doubtdesk.retrieval.lexical_store import lexical_candidates
@@ -29,7 +29,7 @@ def reciprocal_rank_fusion(ranked_lists: list[list[dict]], top_k: int = 8, k: in
 
 
 def hybrid_search(collection, embedding_model, questions: list[str], doc_ids: list[str], top_k: int | None = None, candidate_k: int = 12):
-    top_k = int(os.getenv("RETRIEVAL_TOP_K", "6")) if top_k is None else top_k
+    top_k = runtime_settings().retrieval_top_k if top_k is None else top_k
     if top_k <= 0 or candidate_k <= 0:
         raise ValueError("Retrieval top_k and candidate_k must be positive")
     if not doc_ids or not questions:
@@ -59,7 +59,7 @@ def hybrid_search(collection, embedding_model, questions: list[str], doc_ids: li
 
 
 def forward_evidence_chunks(ranked_chunks: list[dict], max_chunks: int | None = None) -> list[dict]:
-    limit = int(os.getenv("EVIDENCE_FORWARD_TOP_K", "4")) if max_chunks is None else max_chunks
+    limit = runtime_settings().evidence_forward_top_k if max_chunks is None else max_chunks
     if limit <= 0:
         raise ValueError("EVIDENCE_FORWARD_TOP_K must be positive")
     return ranked_chunks[:limit]

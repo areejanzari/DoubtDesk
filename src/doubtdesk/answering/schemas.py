@@ -10,3 +10,8 @@ class EvidenceResult(BaseModel):
     status: Literal["sufficient", "insufficient"]
     answer: str
     sources: list[DocumentSource] = Field(default_factory=list)
+
+class ModelEvidenceResult(BaseModel):
+    status: Literal["sufficient", "insufficient"]
+    answer: str
+    sources: list[str]

@@ -1,3 +1,4 @@
+from doubtdesk.config import settings
 import sqlite3
 from pathlib import Path
 from contextlib import closing
@@ -5,7 +6,7 @@ import time
 
 
 def initialize_registry(
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -51,7 +52,7 @@ def register_document(
     doc_id: str,
     filename: str,
     sha256: str,
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
 ) -> bool:
     with closing(sqlite3.connect(db_path)) as conn, conn:
         cursor = conn.execute(
@@ -68,7 +69,7 @@ def register_document(
 
 def get_document_by_hash(
     sha256: str,
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
 ) -> dict | None:
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
@@ -89,7 +90,7 @@ def update_document_status(
     doc_id: str,
     status: str,
     page_count: int,
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
 ) -> None:
     if status not in {"pending", "processing", "completed", "failed"}:
         raise ValueError(f"Invalid document status: {status}")
@@ -113,7 +114,7 @@ def update_document_status(
 
 def is_document_cached(
     sha256: str,
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
 ) -> bool:
     document = get_document_by_hash(sha256, db_path)
 
@@ -154,6 +155,7 @@ def get_document_page_counts(
 def get_document_names(
     conn: sqlite3.Connection,
     doc_ids: list[str],
+    *, user_id: str,
 ) -> dict[str, str]:
     if not doc_ids:
         return {}
@@ -162,12 +164,13 @@ def get_document_names(
 
     rows = conn.execute(
         f"""
-        SELECT doc_id, filename
-        FROM documents
-        WHERE doc_id IN ({placeholders})
-          AND status = 'completed'
+        SELECT d.doc_id, ud.filename
+        FROM documents AS d
+        JOIN user_documents AS ud ON ud.doc_id = d.doc_id
+        WHERE ud.user_id = ? AND d.doc_id IN ({placeholders})
+          AND d.status = 'completed'
         """,
-        doc_ids,
+        [user_id, *doc_ids],
     ).fetchall()
 
     return {
@@ -229,23 +232,11 @@ def list_documents(
     ]
 
 
-def update_document_filename(
-    doc_id: str,
-    filename: str,
-    db_path: Path = Path("data/documents.db"),
-) -> None:
-    with closing((sqlite3.connect(db_path))) as conn, conn:
-        conn.execute(
-            "UPDATE documents SET filename = ? WHERE doc_id = ?",
-            (filename, doc_id),
-        )
-
-
 def attach_document_to_user(
     user_id: str,
     doc_id: str,
     filename: str,
-    db_path: Path = Path("data/documents.db"),
+    db_path: Path = settings.documents_db,
 ) -> None:
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -338,3 +329,23 @@ def validate_user_document_ids(
         raise ValueError(
             "One or more documents are unavailable."
         )
+
+
+class DocumentProcessing(ValueError):
+    pass
+
+
+def claim_document_ingestion(doc_id, filename, sha256, *, expected_completed=False, db_path=settings.documents_db):
+    with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT doc_id, status, page_count FROM documents WHERE sha256 = ?", (sha256,)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO documents (doc_id, filename, sha256, status) VALUES (?, ?, ?, 'processing')", (doc_id, filename, sha256))
+            return {"doc_id": doc_id, "status": "processing", "page_count": 0}
+        existing_id, status, page_count = row
+        if status == "processing":
+            raise DocumentProcessing("This PDF is still processing. Try again shortly.")
+        if status == "completed" and not expected_completed:
+            return {"doc_id": existing_id, "status": status, "page_count": page_count}
+        conn.execute("UPDATE documents SET status = 'processing', page_count = 0 WHERE doc_id = ?", (existing_id,))
+        return {"doc_id": existing_id, "status": "processing", "page_count": 0}

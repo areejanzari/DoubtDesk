@@ -7,6 +7,8 @@ from doubtdesk.auth.schemas import SignupRequest
 from doubtdesk.auth.security import hash_password, verify_password
 from doubtdesk.auth.store import DB_PATH
 
+DUMMY_PASSWORD_HASH = '$argon2id$v=19$m=65536,t=3,p=4$LPSC2j7Xy54ovZJndwnF6A$Skiafz8somdqy8NCud/CcIyf2pQumj1QTQVitQtjE88'
+
 
 def register_user(
     payload: SignupRequest,
@@ -71,6 +73,7 @@ def authenticate_user(
         ).fetchone()
 
     if user is None:
+        verify_password(password, DUMMY_PASSWORD_HASH)
         return None
 
     if not verify_password(password, user["password_hash"]):

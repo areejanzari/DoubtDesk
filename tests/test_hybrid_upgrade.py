@@ -24,7 +24,7 @@ def test_conversation_limit_preserves_existing_history_and_rejects_new(tmp_path)
     db_path = tmp_path / "conversations.db"
     initialize_memory_db(db_path)
     assert claim_or_check_conversation("first", "u", db_path, max_conversations=2)
-    save_exchange("first", "first question", "first answer", [], "grounded", db_path)
+    save_exchange("first", "first question", "first answer", [], "grounded", db_path, user_id="u")
     assert claim_or_check_conversation("second", "u", db_path, max_conversations=2)
     assert claim_or_check_conversation("first", "u", db_path, max_conversations=2)
 

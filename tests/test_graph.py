@@ -9,6 +9,7 @@ from doubtdesk.graph.nodes import (
     formatting_node,
 )
 from doubtdesk.graph.builder import build_graph
+from doubtdesk.answering.evidence_selection import TextEvidenceAssessment
 from types import SimpleNamespace
 
 @pytest.fixture(autouse=True)
@@ -180,15 +181,27 @@ def test_formatting_node(tmp_path):
         formatter = formatting_node(db_path)
 
         result = formatter({
+            "user_id": "user_A",
             "status": "grounded",
-            "answer": "Photosynthesis uses sunlight.",
+            "answer": "Photosynthesis uses sunlight. (PDF p. 1)",
             "sources": [
                 {"doc_id": "doc_001", "page_numbers": [1]},
             ],
         })
 
-    assert result == {"formatted_answer": "Formatted answer"}
-    mock_format.assert_called_once()
+    assert result == {
+        "answer": "Photosynthesis uses sunlight. [1]",
+        "formatted_answer": "Formatted answer",
+    }
+    mock_format.assert_called_once_with(
+        {
+            "status": "grounded",
+            "answer": "Photosynthesis uses sunlight. [1]",
+            "sources": [{"doc_id": "doc_001", "page_numbers": [1]}],
+        },
+        {"doc_001": "biology.pdf"},
+        normalized=True,
+    )
 
 def test_graph_without_documents(tmp_path):
     db_path = tmp_path / "test.db"
@@ -234,7 +247,7 @@ def test_graph_grounded_route_uses_text_when_sufficient(tmp_path):
     evidence.sources = [source]
     chunks = [{"doc_id": "doc_001", "chunk_id": "a", "page_number": 1,
                "text": "Photosynthesis converts light energy", "distance": 0.1, "rrf_score": 0.03}]
-    assessment = SimpleNamespace(scores=[SimpleNamespace(paraphrase="What is photosynthesis?", score=0.95)] * 3)
+    assessment = TextEvidenceAssessment(sufficiency_score=0.95)
 
     with (
         patch("doubtdesk.graph.nodes.validate_user_document_ids") as owner,

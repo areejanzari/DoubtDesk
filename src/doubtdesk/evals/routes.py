@@ -1,3 +1,4 @@
+from doubtdesk.config import settings
 import os
 import sqlite3
 from contextlib import closing
@@ -19,7 +20,7 @@ router = APIRouter(
 def create_evaluation(payload: EvalsRequest, background: BackgroundTasks, request: Request):
     if not os.getenv("GEMINI_API_KEY"):
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured for RAGAS judge")
-    with closing(sqlite3.connect("data/documents.db")) as conn:
+    with closing(sqlite3.connect(settings.documents_db)) as conn:
         try:
             validate_document_ids(conn, payload.doc_ids)
         except ValueError as exc:

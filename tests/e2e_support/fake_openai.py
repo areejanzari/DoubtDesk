@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from doubtdesk.answering.evidence_selection import TextEvidenceAssessment
 from doubtdesk.answering.output_guardrails import JudgeVerdict
-from doubtdesk.answering.schemas import EvidenceResult
+from doubtdesk.answering.schemas import ModelEvidenceResult
 from doubtdesk.guardrails.paraphrasing import ContextualParaphraseResult
 
 
@@ -29,12 +29,12 @@ class FakeResponses:
     @staticmethod
     def _answer(input_messages):
         content = json.dumps(input_messages)
-        match = re.search(r"Document ID: ([\w-]+), PDF page number: (\d+)", content)
+        match = re.search(r"Source alias: (S\d+), PDF page number: (\d+)", content)
         if match:
             return {
                 "status": "sufficient",
                 "answer": "Photosynthesis converts light energy into chemical energy.",
-                "sources": [{"doc_id": match.group(1), "page_numbers": [int(match.group(2))]}],
+                "sources": [match.group(1)],
             }
         return {"status": "insufficient", "answer": "", "sources": []}
 
@@ -49,20 +49,17 @@ class FakeResponses:
             payload = json.loads(input[1]["content"])
             score = 0.95 if payload["retrieved_text"] else 0.05
             result = {
-                "scores": [
-                    {"paraphrase": question, "score": score, "explanation": "E2E fixture text."}
-                    for question in payload["paraphrases"]
-                ],
+                "sufficiency_score": score,
                 "recommended_image_pages": [],
             }
-        elif text_format is EvidenceResult:
+        elif text_format is ModelEvidenceResult:
             result = self._answer(input)
         else:
             result = None
         return SimpleNamespace(output_parsed=result, output_text="E2E response.", usage=None)
 
     def stream(self, *, model, input, text_format=None, **kwargs):
-        if text_format is EvidenceResult:
+        if text_format is ModelEvidenceResult:
             return FakeStream(json.dumps(self._answer(input)))
         return FakeStream("This is a general knowledge answer.")
 

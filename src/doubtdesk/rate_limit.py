@@ -21,22 +21,3 @@ class RequestPacer:
 
     async def acquire_async(self):
         await asyncio.to_thread(self.acquire)
-
-
-class RateLimitedModels:
-    def __init__(self, models, pacer):
-        self._models = models
-        self._pacer = pacer
-
-    def generate_content(self, *args, **kwargs):
-        self._pacer.acquire()
-        return self._models.generate_content(*args, **kwargs)
-
-
-class RateLimitedGemini:
-    def __init__(self, client, pacer):
-        self._client = client
-        self.models = RateLimitedModels(client.models, pacer)
-
-    def close(self):
-        return self._client.close()

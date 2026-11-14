@@ -1,3 +1,8 @@
+from contextlib import closing
+import sqlite3
+from doubtdesk.config import settings
+from doubtdesk.ingestion.registry import get_document_names
+from doubtdesk.answering.formatting import format_answer
 import logging
 from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -47,6 +52,17 @@ def get_conversation(
     result = get_user_conversation(str(conversation_id), user["user_id"])
     if result is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
+    grounded = [message for message in result["messages"] if message["status"] == "grounded" and message["sources"]]
+    if grounded:
+        doc_ids = list(dict.fromkeys(source["doc_id"] for message in grounded for source in message["sources"]))
+        with closing(sqlite3.connect(settings.documents_db)) as conn:
+            names = get_document_names(conn, doc_ids, user_id=user["user_id"])
+        names = {doc_id: names.get(doc_id, "Unavailable document") for doc_id in doc_ids}
+        for message in grounded:
+            message["formatted_answer"] = format_answer(message, names)
+    for message in result["messages"]:
+        if message["status"] == "grounded" and not message["sources"]:
+            message["formatted_answer"] = message["answer"]
     return result
 
 

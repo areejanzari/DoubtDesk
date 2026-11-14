@@ -1,5 +1,5 @@
+from doubtdesk.config import runtime_settings
 import math
-import os
 from functools import lru_cache
 from openai import AsyncOpenAI
 from ragas.llms import llm_factory
@@ -12,25 +12,25 @@ from doubtdesk.rate_limit import RequestPacer
 
 @lru_cache(maxsize=1)
 def get_judge_pacer():
-    return RequestPacer(int(os.getenv("JUDGE_RPM", "5")))
+    return RequestPacer(runtime_settings().judge_rpm)
 
 
 class RagasJudge:
     def __init__(self):
-        api_key = os.environ["GEMINI_API_KEY"]
+        api_key = runtime_settings().gemini_api_key
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         self.llm = llm_factory(
-            os.getenv("RAGAS_JUDGE_MODEL", "gemini-3.1-flash-lite"),
+            runtime_settings().ragas_judge_model,
             provider="openai",
             client=self.client,
             adapter="instructor",
         )
         embeddings = embedding_factory(
             "huggingface",
-            model=os.getenv("JUDGE_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+            model=runtime_settings().judge_embed_model,
             interface="modern",
         )
         self.metrics = {

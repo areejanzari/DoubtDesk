@@ -2,7 +2,6 @@ import pytest
 
 from doubtdesk.ingestion.quality import (
     count_characters,
-    alphabetic_ratio,
     garbage_character_ratio,
     classify_page,
 )
@@ -20,20 +19,6 @@ from doubtdesk.ingestion.quality import (
 )
 def test_count_characters(text, expected):
     assert count_characters(text) == expected
-
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        pytest.param("abc123", 0.5, id="mixed-characters"),
-        pytest.param("abc", 1.0, id="all-alphabetic"),
-        pytest.param("123", 0.0, id="no-alphabetic"),
-        pytest.param("   ", 0.0, id="whitespace-only"),
-        pytest.param("a b c", 1.0, id="ignore-whitespace"),
-    ],
-)
-def test_alphabetic_ratio(text, expected):
-    assert alphabetic_ratio(text) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(

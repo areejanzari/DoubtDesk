@@ -32,7 +32,6 @@ class FakeSMTP:
 @pytest.fixture
 def smtp(monkeypatch):
     FakeSMTP.instances.clear()
-    monkeypatch.setattr(mailer, "load_dotenv", lambda: None)
     monkeypatch.setattr(mailer.smtplib, "SMTP_SSL", FakeSMTP)
     monkeypatch.setenv("SMTP_HOST", "smtp.example.test")
     monkeypatch.setenv("SMTP_USER", "mailer@example.test")

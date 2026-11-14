@@ -1,20 +1,20 @@
-import os
 import sqlite3
 from contextlib import closing
 from doubtdesk.graph.state import DoubtDeskState
 from doubtdesk.ingestion.registry import get_document_names, validate_user_document_ids
 from doubtdesk.retrieval.hybrid import hybrid_search, forward_evidence_chunks
 from doubtdesk.retrieval.pages import get_page_image_paths
-from doubtdesk.answering.vision import build_grounded_content, generate_vision_answer
+from doubtdesk.answering.vision import build_grounded_content, generate_vision_answer, CandidateValidationError
+from doubtdesk.answering.schemas import EvidenceResult
 from doubtdesk.answering.evidence_selection import (
     assess_text_evidence,
     choose_evidence_route,
 )
 from doubtdesk.answering.validation import validate_evidence_sources, validate_evidence_consistency
 from doubtdesk.answering.fallback import generate_general_answer
-from doubtdesk.answering.formatting import format_answer
+from doubtdesk.answering.formatting import format_answer, normalize_answer_citations
 from doubtdesk.guardrails.paraphrasing import resolve_and_paraphrase
-from doubtdesk.memory.vector import search_memory
+from doubtdesk.memory.context import build_history
 from doubtdesk.guardrails.responses import get_off_topic_response
 from doubtdesk.answering.output_guardrails import (
     review_and_repair, is_document_specific, document_insufficient_result,
@@ -63,7 +63,7 @@ def evidence_selection_node(client, model_name):
     return select
 
 
-def evidence_node(client, model_name):
+def evidence_node(client, model_name, judge=None):
     def evaluate_evidence(state: DoubtDeskState) -> dict:
         chunks = state.get("retrieved_chunks") or []
         pages = state.get("retrieved_pages") or []
@@ -75,17 +75,24 @@ def evidence_node(client, model_name):
             chunks=chunks,
             pages=pages,
         )
-        evidence = generate_vision_answer(
-            client=client,
-            model_name=model_name,
-            content=content,
-            request_id=state.get("request_id"),
-            conversation_id=state.get("conversation_id"),
-            operation=f"grounded_{state.get('evidence_mode', 'visual')}",
-        )
-        validate_evidence_consistency(evidence)
-        validate_evidence_sources(evidence, allowed_pages or pages)
-        return {"evidence": evidence}
+        def generate(feedback=None):
+            evidence = generate_vision_answer(
+                client=client, model_name=model_name, content=content,
+                request_id=state.get("request_id"), conversation_id=state.get("conversation_id"),
+                operation=f"grounded_{state.get('evidence_mode', 'visual')}", feedback=feedback,
+            )
+            validate_evidence_consistency(evidence)
+            validate_evidence_sources(evidence, allowed_pages or pages or chunks)
+            return evidence
+        try:
+            return {"evidence": generate()}
+        except (CandidateValidationError, ValueError) as exc:
+            if judge is not None:
+                return {"evidence": EvidenceResult(status="sufficient", answer="", sources=[]), "candidate_error": str(exc)}
+            try:
+                return {"evidence": generate(str(exc))}
+            except (CandidateValidationError, ValueError):
+                return {"evidence": EvidenceResult(status="insufficient", answer="", sources=[])}
     return evaluate_evidence
 
 
@@ -149,6 +156,8 @@ def output_guardrail_node(client, model_name, judge):
             "answer": state["answer"],
             "sources": state["sources"],
         }
+        if state.get("candidate_error") and result["status"] == "grounded":
+            result["candidate_error"] = state["candidate_error"]
 
         def regenerate(feedback: str) -> dict:
             if result["status"] == "grounded":
@@ -165,7 +174,7 @@ def output_guardrail_node(client, model_name, judge):
                 validate_evidence_consistency(evidence)
                 validate_evidence_sources(evidence, allowed_pages)
                 if evidence.status != "sufficient":
-                    raise ValueError("Regeneration did not find sufficient PDF evidence")
+                    raise CandidateValidationError("Regeneration did not find sufficient PDF evidence")
                 return {
                     "status": "grounded",
                     "answer": evidence.answer,
@@ -217,9 +226,14 @@ def formatting_node(db_path):
     def format_response(state: DoubtDeskState) -> dict:
         response = {"status": state["status"], "answer": state["answer"], "sources": state["sources"]}
         cited_doc_ids = [source["doc_id"] for source in response["sources"]]
-        with sqlite3.connect(db_path) as conn:
-            document_names = get_document_names(conn, cited_doc_ids)
-        return {"formatted_answer": format_answer(response, document_names)}
+        with closing(sqlite3.connect(db_path)) as conn:
+            document_names = get_document_names(conn, cited_doc_ids, user_id=state["user_id"]) if cited_doc_ids else {}
+        if response["status"] == "grounded":
+            response["answer"] = normalize_answer_citations(response["answer"], response["sources"])
+        return {
+            "answer": response["answer"],
+            "formatted_answer": format_answer(response, document_names, normalized=True),
+        }
     return format_response
 
 
@@ -230,7 +244,7 @@ def paraphrase_node(client, model_name, embedding_model=None, memory_collection=
         user_id = state["user_id"]
         history = []
         if conversation_id:
-            history = search_memory(
+            history = build_history(
                 conversation_id=conversation_id,
                 user_id=user_id,
                 question=question,

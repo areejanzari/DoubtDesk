@@ -1,22 +1,23 @@
+from doubtdesk.config import runtime_settings
+from doubtdesk.observability.tracing import trace_stage, update_observation
 import json
 import logging
-import os
 import re
 from pathlib import Path
+from time import perf_counter
+from doubtdesk.analytics.tracker import record_gemini_usage, record_gemini_failure
 from typing import Callable, Literal
 from pydantic import BaseModel, Field
 from google.genai import types
 from doubtdesk.answering.validation import validate_evidence_sources
 from doubtdesk.answering.schemas import EvidenceResult, DocumentSource
+from doubtdesk.answering.vision import CandidateValidationError
 from doubtdesk.rate_limit import RequestPacer
 
 logger = logging.getLogger(__name__)
 
-ANSWER_MAX_OUTPUT_TOKENS = 300
 JUDGE_MAX_OUTPUT_TOKENS = 512
-FALLBACK_MESSAGE = "I couldn't verify a reliable answer to that question right now."
 DOCUMENT_FALLBACK_MESSAGE = "I couldn't find enough evidence in the selected PDF to answer that question."
-DOCUMENT_VERIFICATION_FAILED_MESSAGE = "I found relevant PDF evidence, but could not verify the generated answer. Please try again."
 VERIFICATION_UNAVAILABLE_MESSAGE = "Answer verification is temporarily unavailable. Please try again."
 VERIFICATION_REJECTED_MESSAGE = "I could not produce an answer that passed verification. Please try rephrasing your question."
 
@@ -33,10 +34,10 @@ class JudgeVerdict(BaseModel):
 class GeminiOutputJudge:
     def __init__(self, client, model_name: str | None = None, pacer=None):
         self.client = client
-        self.model_name = model_name or os.getenv("OUTPUT_JUDGE_MODEL", "gemini-3.1-flash-lite")
-        self.pacer = pacer or RequestPacer(int(os.getenv("OUTPUT_JUDGE_RPM", "5")))
+        self.model_name = model_name or runtime_settings().output_judge_model
+        self.pacer = pacer or RequestPacer(runtime_settings().output_judge_rpm)
 
-    def evaluate(self, *, question: str, result: dict, chunks=None, pages=None) -> JudgeVerdict:
+    def evaluate(self, *, question: str, result: dict, chunks=None, pages=None, request_id=None, conversation_id=None) -> JudgeVerdict:
         document_grounded = result["status"] == "grounded"
         source_text = [
             {
@@ -82,27 +83,42 @@ class GeminiOutputJudge:
             temperature=0,
             max_output_tokens=JUDGE_MAX_OUTPUT_TOKENS,
         )
+        def call(model):
+            wait_started = perf_counter()
+            self.pacer.acquire()
+            wait_ms = round((perf_counter() - wait_started) * 1000)
+            if wait_ms >= runtime_settings().output_judge_wait_log_ms:
+                logger.warning("output_judge pacer_wait_ms=%d request_id=%s model=%s", wait_ms, request_id, model)
+            started = perf_counter()
+            response = None
+            try:
+                response = self.client.models.generate_content(model=model, contents=contents, config=config)
+                parsed = getattr(response, "parsed", None)
+                if parsed is None:
+                    parsed = json.loads(response.text or "{}")
+                verdict = JudgeVerdict.model_validate(parsed)
+            except Exception as exc:
+                if request_id:
+                    record_gemini_failure(request_id=request_id, conversation_id=conversation_id, operation="output_judge",
+                                          model=model, latency_ms=round((perf_counter()-started)*1000), error_type=type(exc).__name__,
+                                          response=response, pacer_wait_ms=wait_ms)
+                raise
+            if request_id:
+                record_gemini_usage(response=response, request_id=request_id, conversation_id=conversation_id, operation="output_judge",
+                                    model=model, latency_ms=round((perf_counter()-started)*1000), pacer_wait_ms=wait_ms)
+            return verdict
+
         used_model = self.model_name
         try:
-            self.pacer.acquire()
-            response = self.client.models.generate_content(
-                model=used_model, contents=contents, config=config,
-            )
+            verdict = call(used_model)
         except Exception as exc:
             code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-            backup = os.getenv("OUTPUT_JUDGE_FALLBACK_MODEL", "").strip()
+            backup = runtime_settings().output_judge_fallback_model.strip()
             if code not in (429, 500, 502, 503, 504) or not backup or backup == used_model:
                 raise
             used_model = backup
             logger.warning("Output judge provider failed (%s). Attempting backup model %s", code, used_model)
-            self.pacer.acquire()
-            response = self.client.models.generate_content(
-                model=used_model, contents=contents, config=config,
-            )
-        parsed = getattr(response, "parsed", None)
-        if parsed is None:
-            parsed = json.loads(response.text or "{}")
-        verdict = JudgeVerdict.model_validate(parsed)
+            verdict = call(used_model)
         verdict.passed = bool(
             verdict.passed
             and verdict.safety == "pass"
@@ -134,11 +150,14 @@ def document_insufficient_result() -> dict:
         "status": "general_knowledge",
         "answer": DOCUMENT_FALLBACK_MESSAGE,
         "sources": [],
+        "document_insufficient": True,
         "skip_output_judge": True,
     }
 
 
 def _valid_candidate(result: dict, allowed_pages=None) -> tuple[bool, str]:
+    if result.get("candidate_error"):
+        return False, str(result["candidate_error"])
     answer = result.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         return False, "The generated answer is empty."
@@ -164,7 +183,7 @@ def _valid_candidate(result: dict, allowed_pages=None) -> tuple[bool, str]:
 
 def review_and_repair(
     *, result: dict, question: str, judge, regenerate: Callable[[str], dict],
-    chunks=None, pages=None, allowed_pages=None,
+    chunks=None, pages=None, allowed_pages=None, request_id=None, conversation_id=None,
 ) -> dict:
     candidate = result
     reviews = []
@@ -183,12 +202,20 @@ def review_and_repair(
                 "reason": failure_reason,
                 "feedback": feedback,
             })
+        elif judge is None:
+            return {**candidate, "judge_passed": None, "judge_attempts": 0, "judge_regenerations": regeneration_attempts, "judge_reviews": reviews, "judge_failure_reason": None, "judge_needs_fallback": False}
         else:
             judge_calls += 1
             try:
-                verdict = judge.evaluate(
-                    question=question, result=candidate, chunks=chunks, pages=pages,
-                )
+                with trace_stage("output_verification", as_type="guardrail",
+                                 input={"question": question, "answer_type": candidate.get("status")},
+                                 metadata={"model": getattr(judge, "model_name", None), "attempt": attempt + 1}) as verification:
+                    judge_context = {"request_id": request_id, "conversation_id": conversation_id} if isinstance(judge, GeminiOutputJudge) else {}
+                    verdict = judge.evaluate(
+                        question=question, result=candidate, chunks=chunks, pages=pages, **judge_context,
+                    )
+                    if verification is not None:
+                        update_observation(verification, output=verdict.model_dump(mode="json"))
             except Exception as exc:
                 code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
                 failure_reason = "judge_unavailable" if code in (429, 500, 502, 503, 504) else "judge_api_error"
@@ -230,6 +257,9 @@ def review_and_repair(
             regeneration_attempts += 1
             try:
                 candidate = regenerate(feedback)
+            except (CandidateValidationError, ValueError) as exc:
+                candidate = {"status": result.get("status"), "answer": "", "sources": [], "candidate_error": str(exc)}
+                continue
             except Exception as exc:
                 failure_reason = "regeneration_error"
                 reviews.append({
@@ -251,6 +281,10 @@ def review_and_repair(
         failure_reason, grounded, judge_calls, regeneration_attempts, can_fallback,
     )
     unavailable = failure_reason in {"judge_unavailable", "judge_api_error"}
+    if grounded and failure_reason == "invalid_candidate" and is_document_specific(question):
+        return {**document_insufficient_result(), "judge_passed": False, "judge_attempts": judge_calls,
+                "judge_regenerations": regeneration_attempts, "judge_reviews": reviews,
+                "judge_failure_reason": failure_reason, "judge_needs_fallback": False}
     return {
         "status": "verification_failed",
         "answer": (VERIFICATION_UNAVAILABLE_MESSAGE if unavailable else VERIFICATION_REJECTED_MESSAGE),

@@ -16,6 +16,7 @@ import { conversationApi } from './chat/conversations'
 import type { ConversationSummary, ConversationDetail } from './chat/conversations'
 import { ConversationSidebar } from './chat/ConversationSidebar'
 import { streamAsk } from './chat/stream'
+import { normalizeRawCitations, linkSourceReferences, extractSources, sourcesFromAnswer } from './chat/citations'
 import type { AuthUser } from './auth/api'
 import { AuthScreen } from './auth/AuthScreen'
 
@@ -40,52 +41,26 @@ type AskResponse = {
   conversation_id: string | null
 }
 
-function extractSources(raw: unknown, documents: DocumentInfo[]): Source[] {
-  if (!Array.isArray(raw)) return []
-  const result: Source[] = []
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object') continue
-    const item = entry as Record<string, unknown>
-    const docId = typeof item.doc_id === 'string' ? item.doc_id : undefined
-    const match = documents.find((d) => d.doc_id === docId)
-    const filename = typeof item.filename === 'string' ? item.filename : match?.filename
-    const excerpt = typeof item.excerpt === 'string' ? item.excerpt :
-      typeof item.text === 'string' ? item.text : undefined
-    const rawPages = item.page_numbers ?? item.pages ?? item.page_number ?? item.page
-    const pages = Array.isArray(rawPages) ? rawPages : [rawPages]
-    if (!filename) continue
-    for (const rawPage of pages) {
-      const page = typeof rawPage === 'number' ? rawPage :
-        typeof rawPage === 'string' && /^\d+$/.test(rawPage) ? Number(rawPage) : NaN
-      if (Number.isInteger(page) && page > 0) result.push({ docId, filename, page, excerpt })
-    }
-  }
-  return result.filter((s, i, all) => all.findIndex((x) => x.filename === s.filename && x.page === s.page) === i)
-}
-
-// Fallback for the backend's existing formatted_answer citation convention.
-// Extracts only references that the backend actually returned; never invents them.
-function sourcesFromAnswer(answer: string, documents: DocumentInfo[]): Source[] {
-  const result: Source[] = []
-  const pattern = /([^\n:]+?\.pdf)\s*:\s*PDF page\(s\)\s*([\d,\s-]+)/gi
-  for (const match of answer.matchAll(pattern)) {
-    const filename = match[1].trim().replace(/^[-*\s]+/, '')
-    const doc = documents.find((d) => d.filename.toLowerCase() === filename.toLowerCase())
-    const numbers = match[2].match(/\d+/g) || []
-    for (const number of numbers) result.push({ filename, docId: doc?.doc_id, page: Number(number) })
-  }
-  return result.filter((s, i, all) => all.findIndex((x) => x.filename === s.filename && x.page === s.page) === i)
-}
-
-function MarkdownContent({ content }: { content: string }) {
+function MarkdownContent({ content, sources = [], onSourceOpen }: {
+  content: string
+  sources?: Source[]
+  onSourceOpen?: (source: Source) => void
+}) {
+  const normalized = sources.length ? normalizeRawCitations(content, sources) : content
+  const linked = linkSourceReferences(normalized, sources.length)
   return (
     <div className="markdown-body min-w-0 break-words">
       <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}
         components={{
-          a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>,
+          a: ({ href, children }) => {
+            const sourceMatch = /^#doubtdesk-source-(\d+)$/.exec(href || '')
+            const source = sourceMatch ? sources[Number(sourceMatch[1]) - 1] : undefined
+            if (source) return <button type="button" aria-label={`Open source ${sourceMatch![1]}`} onClick={() => onSourceOpen?.(source)} className="rounded text-[#3155E7] underline underline-offset-2 hover:text-[#153fc9]">{`[${sourceMatch![1]}]`}</button>
+            return <a href={href} target="_blank" rel="noreferrer">{children}</a>
+          },
           img: ({ src, alt }) => <img src={src} alt={alt || 'Provided illustration'} loading="lazy" />,
         }}
-      >{content}</ReactMarkdown>
+      >{linked}</ReactMarkdown>
     </div>
   )
 }
@@ -346,10 +321,10 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
     setViewerFullscreen(false)
   }
 
-  const activeViewerDoc = viewerSource && documents.find((d) =>
-    (viewerSource.docId && d.doc_id === viewerSource.docId) || d.filename === viewerSource.filename)
-  const pageImagePath = viewerSource && activeViewerDoc && PAGE_IMAGE_TEMPLATE
-    ? PAGE_IMAGE_TEMPLATE.replace('{doc_id}', encodeURIComponent(activeViewerDoc.doc_id)).replace('{page}', String(viewerPage))
+  const activeViewerDoc = viewerSource && documents.find(d => d.doc_id === viewerSource.docId)
+  const viewerDocId = viewerSource?.docId
+  const pageImagePath = viewerSource && viewerDocId && PAGE_IMAGE_TEMPLATE
+    ? PAGE_IMAGE_TEMPLATE.replace('{doc_id}', encodeURIComponent(viewerDocId)).replace('{page}', String(viewerPage))
     : null
 
   useEffect(() => {
@@ -446,8 +421,8 @@ function TutorApp({ user, onUnauthorized, onLogout }: {
               {message.role === 'assistant' && <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-[#4169FF]"><GraduationCap size={17} /></div>}
               <div className={message.role === 'user' ? 'max-w-[88%] rounded-2xl rounded-tr-md bg-[#EEF2FF] px-4 py-3 text-sm leading-7 sm:max-w-[78%]' : 'min-w-0 max-w-full flex-1'}>
                 {message.role === 'assistant' && <div className="mb-2 flex flex-wrap items-center gap-2"><span className="text-sm font-semibold">DoubtDesk</span>{message.status === 'grounded' && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">From documents</span>}{message.status === 'general_knowledge' && <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">Not from document</span>}{message.status === 'verification_failed' && <span className="rounded-full bg-red-50 px-2 py-0.5 text-xs text-red-700">Verification unavailable</span>}{message.status === 'out_of_scope' && <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">Outside academic scope</span>}{message.error && <span className="text-xs text-red-600">Request failed</span>}</div>}
-                {message.role === 'assistant' ? <MarkdownContent content={message.content} /> : <p className="whitespace-pre-wrap break-words">{message.content}</p>}
-                {message.role === 'assistant' && <div className="mt-4 space-y-2"><button className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-slate-500 hover:bg-slate-100" onClick={() => { void navigator.clipboard.writeText(message.content).then(() => { setCopiedId(message.id); window.setTimeout(() => setCopiedId(null), 1500) }).catch(() => {}) }}>{copiedId === message.id ? <Check size={14} /> : <Clipboard size={14} />}{copiedId === message.id ? 'Copied' : 'Copy answer'}</button>
+                {message.role === 'assistant' ? <MarkdownContent content={message.content} sources={message.sources} onSourceOpen={openSource} /> : <p className="whitespace-pre-wrap break-words">{message.content}</p>}
+                {message.role === 'assistant' && <div className="mt-4 space-y-2"><button className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-slate-500 hover:bg-slate-100" onClick={() => { void navigator.clipboard.writeText(message.sources?.length ? normalizeRawCitations(message.content, message.sources) : message.content).then(() => { setCopiedId(message.id); window.setTimeout(() => setCopiedId(null), 1500) }).catch(() => {}) }}>{copiedId === message.id ? <Check size={14} /> : <Clipboard size={14} />}{copiedId === message.id ? 'Copied' : 'Copy answer'}</button>
                   {!!message.sources?.length && <div className="border-t border-slate-100 pt-3"><p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Sources</p><div className="flex flex-wrap gap-2">{message.sources.map((source, index) => <button key={`${source.filename}-${source.page}-${index}`} className="flex max-w-full items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:border-blue-300 hover:bg-blue-50" onClick={() => openSource(source)}><FileText size={16} className="mt-0.5 shrink-0 text-[#4169FF]" /><span className="min-w-0"><span className="block break-all text-xs font-medium">[{index + 1}] {source.filename}</span><span className="text-xs text-slate-500">Page {source.page}</span>{source.excerpt && <span className="mt-1 block line-clamp-2 text-xs text-slate-500">{source.excerpt}</span>}</span></button>)}</div></div>}
                 </div>}
               </div>

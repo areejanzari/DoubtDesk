@@ -1,7 +1,6 @@
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from doubtdesk.answering.service import answer_question, resolve_answer
 from doubtdesk.answering.formatting import format_answer
 from doubtdesk.answering.fallback import generate_general_answer
 from doubtdesk.answering.vision import generate_vision_answer, build_vision_content, build_grounded_content
@@ -10,77 +9,6 @@ from doubtdesk.answering.vision import generate_vision_answer, build_vision_cont
 @pytest.fixture
 def client():
     return MagicMock()
-
-
-def test_empty_question(client):
-    with pytest.raises(ValueError, match="Question cannot be empty"):
-        answer_question("", [], client, "test-model")
-
-
-def test_no_pages_uses_general_knowledge(client):
-    with patch(
-        "doubtdesk.answering.service.generate_general_answer",
-        return_value="Water is H2O.",
-    ) as mock_general:
-        result = answer_question(
-            "What is water?", [], client, "test-model"
-        )
-
-    assert result == {
-        "status": "general_knowledge",
-        "answer": "Water is H2O.",
-        "sources": [],
-    }
-
-    mock_general.assert_called_once()
-
-
-def test_grounded_answer(client):
-    source = MagicMock()
-    source.doc_id = "doc_001"
-    source.page_numbers = [2]
-    source.model_dump.return_value = {
-        "doc_id": "doc_001",
-        "page_numbers": [2],
-    }
-
-    evidence = MagicMock()
-    evidence.status = "sufficient"
-    evidence.answer = "Photosynthesis converts light energy."
-    evidence.sources = [source]
-
-    pages = [{"doc_id": "doc_001", "page_number": 2}]
-
-    result = resolve_answer(
-        evidence, pages, "What is photosynthesis?", client, "test-model"
-    )
-
-    assert result["status"] == "grounded"
-    assert result["answer"] == evidence.answer
-    assert result["sources"] == [source.model_dump.return_value]
-
-
-def test_insufficient_evidence_falls_back(client):
-    evidence = MagicMock()
-    evidence.status = "insufficient"
-    evidence.answer = ""
-    evidence.sources = []
-
-    with patch(
-        "doubtdesk.answering.service.generate_general_answer",
-        return_value="General knowledge answer",
-    ) as mock_general:
-        result = resolve_answer(
-            evidence,
-            [{"doc_id": "doc_001", "page_number": 1}],
-            "Explain gravity",
-            client,
-            "test-model",
-        )
-
-    assert result["status"] == "general_knowledge"
-    assert result["sources"] == []
-    mock_general.assert_called_once()
 
 
 def test_format_grounded_answer():
@@ -230,7 +158,7 @@ def test_generate_vision_answer(client):
 
     client.responses.parse.assert_called_once()
     assert client.responses.parse.call_args.kwargs["reasoning"] == {"effort": "none"}
-    assert client.responses.parse.call_args.kwargs["max_output_tokens"] == 300
+    assert client.responses.parse.call_args.kwargs["max_output_tokens"] == 700
 
 
 def test_generate_vision_answer_invalid_response(client):

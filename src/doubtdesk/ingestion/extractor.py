@@ -1,3 +1,4 @@
+import logging
 import pymupdf
 from pathlib import Path
 from doubtdesk.ingestion.quality import classify_page,image_coverage
@@ -10,10 +11,12 @@ def extract_page_content(page: pymupdf.Page) -> dict:
     classification = classify_page(text,coverage)
 
     if classification == "ocr_candidate":
-        ocr_text = extract_text_with_ocr(page)
-
-        if ocr_text.strip():
-            text = ocr_text
+        try:
+            ocr_text = extract_text_with_ocr(page)
+            if ocr_text.strip():
+                text = ocr_text
+        except Exception:
+            logging.getLogger(__name__).warning("OCR failed; retaining native page text", exc_info=True)
 
     return {
         "text": text,

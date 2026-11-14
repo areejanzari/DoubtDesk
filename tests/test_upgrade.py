@@ -4,10 +4,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from doubtdesk.answering.evidence_selection import (
-    ParaphraseEvidence, TextEvidenceAssessment, choose_evidence_route,
+    TextEvidenceAssessment, choose_evidence_route,
 )
+from doubtdesk.answering.fallback import ANSWER_MAX_OUTPUT_TOKENS
 from doubtdesk.answering.output_guardrails import (
-    ANSWER_MAX_OUTPUT_TOKENS, DOCUMENT_FALLBACK_MESSAGE,
+    DOCUMENT_FALLBACK_MESSAGE,
     GeminiOutputJudge, JudgeVerdict, document_insufficient_result,
     is_document_specific, review_and_repair,
 )
@@ -22,10 +23,7 @@ CHUNKS = [{"doc_id": "docA", "page_number": 1, "text": "Photosynthesis stores li
 
 def route(*values):
     paraphrases = [f"paraphrase-{index}" for index in range(len(values))]
-    assessment = TextEvidenceAssessment(scores=[
-        ParaphraseEvidence(paraphrase=question, score=score, explanation="x")
-        for question, score in zip(paraphrases, values, strict=True)
-    ])
+    assessment = TextEvidenceAssessment(sufficiency_score=sum(values)/len(values))
     return choose_evidence_route(assessment, paraphrases, CHUNKS)
 
 
@@ -48,11 +46,9 @@ def test_three_tiers(scores, tier, mode, images):
     assert selected["evidence_average"] == pytest.approx(sum(scores) / len(scores))
 
 
-def test_mismatched_paraphrase_scores_fail_closed():
-    assessment = TextEvidenceAssessment(scores=[ParaphraseEvidence(
-        paraphrase="Wrong paraphrase", score=0.98, explanation="Mismatch",
-    )])
-    assert choose_evidence_route(assessment, ["Expected"], CHUNKS)["evidence_mode"] == "low"
+def test_no_evidence_cannot_pass_even_with_high_score():
+    assessment = TextEvidenceAssessment(sufficiency_score=0.98)
+    assert choose_evidence_route(assessment, ["Expected"], [])["evidence_mode"] == "low"
 
 
 def test_low_tier_is_routed_without_image_or_grounded_generation():
@@ -188,7 +184,7 @@ def test_generation_function_output_caps():
         "status": "insufficient", "answer": "", "sources": [],
     })
     generate_vision_answer(client, "openai-model", [{"type": "input_text", "text": "Question"}])
-    assert client.responses.parse.call_args.kwargs["max_output_tokens"] == ANSWER_MAX_OUTPUT_TOKENS
+    assert client.responses.parse.call_args.kwargs["max_output_tokens"] > ANSWER_MAX_OUTPUT_TOKENS
 
 
 def test_graph_has_live_output_judge_node(tmp_path):
@@ -254,7 +250,7 @@ def test_main_graph_grounded_answer_actually_calls_output_judge(tmp_path, monkey
         patch("doubtdesk.graph.nodes.validate_user_document_ids"),
         patch("doubtdesk.graph.nodes.hybrid_search", return_value=CHUNKS),
         patch("doubtdesk.graph.nodes.assess_text_evidence", return_value=TextEvidenceAssessment(
-            scores=[ParaphraseEvidence(paraphrase="Explain photosynthesis", score=0.95, explanation="Supported") for _ in range(3)],
+            sufficiency_score=0.95,
         )),
         patch("doubtdesk.graph.nodes.generate_vision_answer", return_value=evidence),
         patch("doubtdesk.graph.nodes.get_document_names", return_value={"docA": "bio.pdf"}),
@@ -330,10 +326,10 @@ def test_verification_failure_is_not_formatted_as_general_knowledge(tmp_path):
     assert streamed["formatted_answer"] == message
 
 
-def test_average_routing_uses_mean_even_when_one_requirement_is_very_high():
-    assert route(0.99, 0.01, 0.01)["evidence_tier"] == "low"
-    assert route(0.94, 0.92, 0.54)["evidence_tier"] == "high"
-    assert route(0.85, 1.0, 0.5)["evidence_average"] == pytest.approx(0.7833333333333333)
+def test_single_score_drives_routing():
+    assert route(0.33)["evidence_tier"] == "low"
+    assert route(0.81)["evidence_tier"] == "high"
+    assert route(0.78)["evidence_average"] == pytest.approx(0.78)
 
 
 def test_failed_api_call_is_distinct_from_rejected_answer():

@@ -1,10 +1,11 @@
+from doubtdesk.config import settings
 import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from time import time_ns
 
-DB_PATH = Path("data/conversations.db")
+DB_PATH = settings.conversations_db
 MAX_CONVERSATIONS_PER_USER = 30
 MAX_CONVERSATION_TITLE_LENGTH = 80
 
@@ -80,7 +81,8 @@ def initialize_memory_db(db_path: Path = DB_PATH) -> None:
                 status TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 formatted_answer TEXT,
-                sources_json TEXT NOT NULL DEFAULT '[]'
+                sources_json TEXT NOT NULL DEFAULT '[]',
+                memory_eligible INTEGER NOT NULL DEFAULT 1
             )
             """
         )
@@ -91,6 +93,9 @@ def initialize_memory_db(db_path: Path = DB_PATH) -> None:
             conn.execute(
                 "ALTER TABLE exchanges ADD COLUMN sources_json TEXT NOT NULL DEFAULT '[]'"
             )
+        if "memory_eligible" not in exchange_cols:
+            conn.execute("ALTER TABLE exchanges ADD COLUMN memory_eligible INTEGER NOT NULL DEFAULT 1")
+        conn.execute("UPDATE exchanges SET memory_eligible = 0 WHERE status IN ('out_of_scope', 'verification_failed') OR answer = ?", ("I couldn't find enough evidence in the selected PDF to answer that question.",))
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_exchanges_conversation
@@ -124,24 +129,23 @@ def save_exchange(
     status: str,
     db_path: Path = DB_PATH,
     *,
-    user_id: str | None = None,
+    user_id: str,
     formatted_answer: str | None = None,
     sources: list[dict] | None = None,
+    memory_eligible: bool = True,
 ):
     with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
-        if user_id is not None:
-            owner = conn.execute(
-                "SELECT user_id FROM conversations WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if owner is None or owner[0] != user_id:
-                raise ValueError("Conversation not found.")
+        owner = conn.execute(
+            "SELECT user_id FROM conversations WHERE conversation_id = ?", (conversation_id,),
+        ).fetchone()
+        if not user_id or owner is None or owner[0] != user_id:
+            raise ValueError("Conversation not found.")
         cursor = conn.execute(
             """
             INSERT INTO exchanges
-                (conversation_id, question, answer, doc_ids, status, formatted_answer, sources_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (conversation_id, question, answer, doc_ids, status, formatted_answer, sources_json, memory_eligible)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 conversation_id,
@@ -151,6 +155,7 @@ def save_exchange(
                 status,
                 formatted_answer,
                 json.dumps(sources or []),
+                int(memory_eligible and status not in ("out_of_scope", "verification_failed")),
             ),
         )
         conn.execute(
@@ -166,34 +171,6 @@ def save_exchange(
             (time_ns(), conversation_id, cursor.lastrowid, _title_from_question(question), conversation_id),
         )
         return cursor.lastrowid
-
-
-def get_recent_exchanges(
-    conversation_id: str,
-    limit: int = 3,
-    db_path: Path = DB_PATH,
-) -> list[dict]:
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT question, answer, doc_ids, status
-            FROM exchanges
-            WHERE conversation_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (conversation_id, limit),
-        ).fetchall()
-    return [
-        {
-            "question": row["question"],
-            "answer": row["answer"],
-            "doc_ids": json.loads(row["doc_ids"]),
-            "status": row["status"],
-        }
-        for row in reversed(rows)
-    ]
 
 
 def claim_or_check_conversation(
@@ -342,6 +319,7 @@ def get_user_recent_exchanges(
     user_id: str,
     limit: int = 3,
     db_path: Path = DB_PATH,
+    *, eligible_only: bool = False,
 ) -> list[dict]:
     if limit < 1:
         raise ValueError("Limit must be positive.")
@@ -349,18 +327,20 @@ def get_user_recent_exchanges(
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT e.question, e.answer, e.doc_ids, e.status
+            SELECT e.id, e.question, e.answer, e.doc_ids, e.status
             FROM exchanges AS e
             JOIN conversations AS c
                 ON e.conversation_id = c.conversation_id
             WHERE e.conversation_id = ? AND c.user_id = ?
+              AND (? = 0 OR (e.memory_eligible = 1 AND e.status NOT IN ('out_of_scope', 'verification_failed')))
             ORDER BY e.id DESC
             LIMIT ?
             """,
-            (conversation_id, user_id, limit),
+            (conversation_id, user_id, int(eligible_only), limit),
         ).fetchall()
     return [
         {
+            "id": row["id"],
             "question": row["question"],
             "answer": row["answer"],
             "doc_ids": json.loads(row["doc_ids"]),
@@ -368,3 +348,27 @@ def get_user_recent_exchanges(
         }
         for row in reversed(rows)
     ]
+
+
+def get_user_eligible_exchanges_by_ids(conversation_id, user_id, ids, db_path=DB_PATH):
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(f"""SELECT e.id, e.question, e.answer, e.doc_ids, e.status
+            FROM exchanges e JOIN conversations c ON c.conversation_id = e.conversation_id
+            WHERE e.conversation_id = ? AND c.user_id = ? AND e.memory_eligible = 1
+              AND e.status NOT IN ('out_of_scope', 'verification_failed') AND e.id IN ({placeholders})
+            ORDER BY e.id""", (conversation_id, user_id, *ids)).fetchall()
+    return [{**dict(row), "doc_ids": json.loads(row["doc_ids"])} for row in rows]
+
+
+def delete_empty_conversation(conversation_id, user_id, db_path=DB_PATH):
+    with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
+        cursor = conn.execute(
+            """DELETE FROM conversations WHERE conversation_id = ? AND user_id = ?
+            AND custom_title = 0 AND NOT EXISTS (
+                SELECT 1 FROM exchanges WHERE exchanges.conversation_id = conversations.conversation_id
+            )""", (conversation_id, user_id))
+        return cursor.rowcount == 1

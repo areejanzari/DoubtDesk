@@ -3,14 +3,6 @@ from pydantic import BaseModel, Field
 from doubtdesk.answering.schemas import DocumentSource
 
 
-class CreateConversationResponse(BaseModel):
-    conversation_id: UUID
-    title: str
-    created_at: str
-    last_accessed_ns: int
-    message_count: int = 0
-
-
 class RenameConversationRequest(BaseModel):
     title: str = Field(min_length=1, max_length=80)
 

@@ -14,16 +14,11 @@ def record_gemini_usage(
     operation: str,
     model: str,
     latency_ms: int,
+    pacer_wait_ms: int | None = None,
     db_path: Path = DB_PATH,
 ) -> None:
     usage = getattr(response, "usage_metadata", None)
 
-    if usage is None:
-        logger.warning(
-            "Gemini usage metadata unavailable for %s",
-            operation,
-        )
-        return
 
     try:
         with sqlite3.connect(db_path) as conn:
@@ -40,22 +35,23 @@ def record_gemini_usage(
                     cached_tokens,
                     total_tokens,
                     latency_ms,
-                    status
+                    status, provider, pacer_wait_ms
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gemini', ?)
                 """,
                 (
                     request_id,
                     conversation_id,
                     operation,
                     model,
-                    usage.prompt_token_count,
-                    usage.candidates_token_count,
-                    usage.thoughts_token_count,
-                    usage.cached_content_token_count,
-                    usage.total_token_count,
+                    getattr(usage, "prompt_token_count", None),
+                    getattr(usage, "candidates_token_count", None),
+                    getattr(usage, "thoughts_token_count", None),
+                    getattr(usage, "cached_content_token_count", None),
+                    getattr(usage, "total_token_count", None),
                     latency_ms,
                     "success",
+                    pacer_wait_ms,
                 ),
             )
     except sqlite3.Error:
@@ -71,6 +67,7 @@ def record_gemini_failure(
     latency_ms: int,
     error_type: str,
     response=None,
+    pacer_wait_ms: int | None = None,
     db_path: Path = DB_PATH,
 ) -> None:
     usage = getattr(response, "usage_metadata", None)
@@ -94,9 +91,9 @@ def record_gemini_failure(
                     total_tokens,
                     latency_ms,
                     status,
-                    error_type
+                    error_type, provider, pacer_wait_ms
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gemini', ?)
                 """,
                 (
                     request_id,
@@ -111,6 +108,7 @@ def record_gemini_failure(
                     latency_ms,
                     "error",
                     error_type,
+                    pacer_wait_ms,
                 ),
             )
     except sqlite3.Error:
@@ -129,8 +127,8 @@ def record_openai_usage(*, response, request_id, conversation_id=None, operation
                 """INSERT INTO ai_usage
                     (request_id, conversation_id, operation, model, prompt_tokens,
                      output_tokens, thinking_tokens, cached_tokens, total_tokens,
-                     latency_ms, status)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success')""",
+                     latency_ms, status, provider)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', 'openai')""",
                 (
                     request_id, conversation_id, operation, model,
                     getattr(usage, "input_tokens", None),

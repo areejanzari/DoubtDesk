@@ -1,3 +1,4 @@
+from doubtdesk.config import settings
 from pathlib import Path
 import chromadb
 import numpy as np
@@ -5,9 +6,10 @@ from chromadb.api.models.Collection import Collection
 from doubtdesk.ingestion.schemas import ChunkRecord
 
 def get_collection(
-        store_path: Path = Path("data/chroma")
+        store_path: Path = settings.chroma_path, *, client=None
 ) -> Collection:
-    client = chromadb.PersistentClient(path=str(store_path))
+    if client is None:
+        client = chromadb.PersistentClient(path=str(store_path))
 
     collection = client.get_or_create_collection(
         name="doubtdesk_chunks",
