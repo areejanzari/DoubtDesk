@@ -1,258 +1,122 @@
-import sqlite3
-from contextlib import closing
+import asyncio
+from doubtdesk.config import runtime_settings
+from doubtdesk.db import connection
 from doubtdesk.graph.state import DoubtDeskState
-from doubtdesk.ingestion.registry import get_document_names, validate_user_document_ids
-from doubtdesk.retrieval.hybrid import hybrid_search, forward_evidence_chunks
+from doubtdesk.ingestion.registry import validate_user_document_ids
+from doubtdesk.ingestion.figures import question_refs
+from doubtdesk.llm import run_coroutine
+from doubtdesk.retrieval.hybrid import aretrieve_ranked_evidence, retrieval_queries
 from doubtdesk.retrieval.pages import get_page_image_paths
-from doubtdesk.answering.vision import build_grounded_content, generate_vision_answer, CandidateValidationError
-from doubtdesk.answering.schemas import EvidenceResult
+from doubtdesk.retrieval.vector_store import page_metadata, pages_with_figure_refs
 from doubtdesk.answering.evidence_selection import (
-    assess_text_evidence,
+    aassess_text_evidence,
     choose_evidence_route,
+    choose_evidence_route_rules,
 )
-from doubtdesk.answering.validation import validate_evidence_sources, validate_evidence_consistency
-from doubtdesk.answering.fallback import generate_general_answer
-from doubtdesk.answering.formatting import format_answer, normalize_answer_citations
-from doubtdesk.guardrails.paraphrasing import resolve_and_paraphrase
-from doubtdesk.memory.context import build_history
+from doubtdesk.guardrails.paraphrasing import aresolve_and_paraphrase
+from doubtdesk.memory.context import abuild_history
 from doubtdesk.guardrails.responses import get_off_topic_response
-from doubtdesk.answering.output_guardrails import (
-    review_and_repair, is_document_specific, document_insufficient_result,
-    VERIFICATION_UNAVAILABLE_MESSAGE,
-)
 
 
-def retrieve_node(collection, embedding_model, db_path):
-    def retrieve(state: DoubtDeskState) -> dict:
+def _sync(async_node):
+    def node(state: DoubtDeskState) -> dict:
+        return run_coroutine(async_node(state))
+    return node
+
+
+def aretrieve_node(embedding_model, reranker=None):
+    async def retrieve(state: DoubtDeskState) -> dict:
         question = state["question"]
         doc_ids = state["doc_ids"]
         if not question.strip():
             raise ValueError("Question cannot be empty")
         if not doc_ids:
             return {"retrieved_chunks": [], "retrieved_pages": []}
-        with closing(sqlite3.connect(db_path)) as conn:
-            validate_user_document_ids(conn, user_id=state["user_id"], doc_ids=doc_ids)
-        ranked_chunks = hybrid_search(
-            collection,
-            embedding_model,
-            state.get("paraphrases") or [question],
-            doc_ids,
+
+        def validate():
+            with connection() as conn:
+                validate_user_document_ids(conn, user_id=state["user_id"], doc_ids=doc_ids)
+
+        await asyncio.to_thread(validate)
+        resolved = state.get("resolved_question") or question
+        queries = retrieval_queries(resolved, state.get("paraphrases") or [question])
+        ranked, forwarded = await aretrieve_ranked_evidence(
+            embedding_model, queries, doc_ids, question=resolved, reranker=reranker,
         )
-        return {"retrieved_chunks": forward_evidence_chunks(ranked_chunks), "retrieved_pages": [], "retrieval_candidate_count": len(ranked_chunks)}
+        scores = [chunk["rerank_score"] for chunk in forwarded if "rerank_score" in chunk and not chunk.get("context_only")]
+        return {
+            "retrieved_chunks": forwarded,
+            "retrieved_pages": [],
+            "retrieval_candidate_count": len(ranked),
+            "retrieval_top_score": max(scores) if scores else None,
+        }
     return retrieve
 
 
-def evidence_selection_node(client, model_name):
-    def select(state: DoubtDeskState) -> dict:
+def retrieve_node(embedding_model, reranker=None):
+    return _sync(aretrieve_node(embedding_model, reranker))
+
+
+async def _rule_selection(state: DoubtDeskState) -> dict:
+    chunks = state.get("retrieved_chunks") or []
+    question = state.get("resolved_question", state["question"])
+    refs = question_refs(question)
+    referenced = []
+    if refs and state.get("doc_ids"):
+        try:
+            referenced = await asyncio.to_thread(pages_with_figure_refs, state["doc_ids"], refs)
+        except Exception:
+            referenced = []
+    keys = list(dict.fromkeys([(chunk["doc_id"], int(chunk["page_number"])) for chunk in chunks] + referenced))
+    try:
+        meta = await asyncio.to_thread(page_metadata, keys)
+    except Exception:
+        meta = {}
+    return choose_evidence_route_rules(question, chunks, meta, state.get("retrieval_top_score"), referenced)
+
+
+def aevidence_selection_node(client, model_name):
+    async def select(state: DoubtDeskState) -> dict:
         chunks = state["retrieved_chunks"]
         paraphrases = state["paraphrases"]
-        assessment = assess_text_evidence(
-            client,
-            model_name,
-            state.get("resolved_question", state["question"]),
-            paraphrases,
-            chunks,
-            state.get("request_id"),
-            state.get("conversation_id"),
-        )
-        selection = choose_evidence_route(assessment, paraphrases, chunks)
+        if runtime_settings().evidence_assessment_enabled:
+            assessment = await aassess_text_evidence(
+                client,
+                model_name,
+                state.get("resolved_question", state["question"]),
+                paraphrases,
+                chunks,
+                state.get("request_id"),
+                state.get("conversation_id"),
+            )
+            selection = choose_evidence_route(assessment, paraphrases, chunks)
+            selection["evidence_assessment"] = assessment
+        else:
+            selection = await _rule_selection(state)
         if selection["evidence_mode"] == "visual":
-            selection["retrieved_pages"] = get_page_image_paths(selection["retrieved_pages"])
-        selection["evidence_assessment"] = assessment
+            selection["retrieved_pages"] = await asyncio.to_thread(get_page_image_paths, selection["retrieved_pages"])
         return selection
     return select
 
 
-def evidence_node(client, model_name, judge=None):
-    def evaluate_evidence(state: DoubtDeskState) -> dict:
-        chunks = state.get("retrieved_chunks") or []
-        pages = state.get("retrieved_pages") or []
-        allowed_pages = state.get("evidence_pages") or []
-        if not chunks and not pages:
-            raise ValueError("Evidence evaluation requires retrieved text or pages")
-        content = build_grounded_content(
-            question=state.get("resolved_question", state["question"]),
-            chunks=chunks,
-            pages=pages,
-        )
-        def generate(feedback=None):
-            evidence = generate_vision_answer(
-                client=client, model_name=model_name, content=content,
-                request_id=state.get("request_id"), conversation_id=state.get("conversation_id"),
-                operation=f"grounded_{state.get('evidence_mode', 'visual')}", feedback=feedback,
-            )
-            validate_evidence_consistency(evidence)
-            validate_evidence_sources(evidence, allowed_pages or pages or chunks)
-            return evidence
-        try:
-            return {"evidence": generate()}
-        except (CandidateValidationError, ValueError) as exc:
-            if judge is not None:
-                return {"evidence": EvidenceResult(status="sufficient", answer="", sources=[]), "candidate_error": str(exc)}
-            try:
-                return {"evidence": generate(str(exc))}
-            except (CandidateValidationError, ValueError):
-                return {"evidence": EvidenceResult(status="insufficient", answer="", sources=[])}
-    return evaluate_evidence
+def evidence_selection_node(client, model_name):
+    return _sync(aevidence_selection_node(client, model_name))
 
 
-def fallback_node(client, model_name):
-    def generate_fallback(state: DoubtDeskState) -> dict:
-        question = state.get("resolved_question", state["question"])
-        from_rejected_grounding = bool(state.get("judge_needs_fallback"))
-        if state.get("doc_ids") and is_document_specific(question):
-            return document_insufficient_result()
-        try:
-            answer = generate_general_answer(
-                client=client,
-                model_name=model_name,
-                question=question,
-                request_id=state.get("request_id"),
-                conversation_id=state.get("conversation_id"),
-            )
-        except Exception:
-            if not from_rejected_grounding:
-                raise
-            return {
-                "status": "verification_failed", "answer": VERIFICATION_UNAVAILABLE_MESSAGE,
-                "sources": [], "judge_needs_fallback": False,
-                "judge_fallback_attempted": True, "skip_output_judge": True,
-                "judge_failure_reason": "fallback_generation_error",
-                "verification_failed": True,
-            }
-        response = {"status": "general_knowledge", "answer": answer, "sources": []}
-        if from_rejected_grounding:
-            response.update({
-                "judge_needs_fallback": False,
-                "judge_fallback_attempted": True,
-                "skip_output_judge": False,
-                "verification_failed": False,
-            })
-        return response
-    return generate_fallback
-
-
-def insufficient_document_node(state: DoubtDeskState) -> dict:
-    return document_insufficient_result()
-
-
-def route_selected_evidence(state: DoubtDeskState) -> str:
-    if state.get("evidence_mode") != "low":
-        return "evidence"
-    question = state.get("resolved_question", state["question"])
-    return "insufficient_document" if is_document_specific(question) else "fallback"
-
-
-def output_guardrail_node(client, model_name, judge):
-    def review(state: DoubtDeskState) -> dict:
-        if state.get("skip_output_judge") or state.get("status") == "out_of_scope":
-            return {}
-        question = state.get("resolved_question", state["question"])
-        chunks = state.get("retrieved_chunks") or []
-        pages = state.get("retrieved_pages") or []
-        allowed_pages = state.get("evidence_pages") or []
-        result = {
-            "status": state["status"],
-            "answer": state["answer"],
-            "sources": state["sources"],
-        }
-        if state.get("candidate_error") and result["status"] == "grounded":
-            result["candidate_error"] = state["candidate_error"]
-
-        def regenerate(feedback: str) -> dict:
-            if result["status"] == "grounded":
-                content = build_grounded_content(question, chunks, pages)
-                evidence = generate_vision_answer(
-                    client=client,
-                    model_name=model_name,
-                    content=content,
-                    request_id=state.get("request_id"),
-                    conversation_id=state.get("conversation_id"),
-                    operation="grounded_regeneration",
-                    feedback=feedback,
-                )
-                validate_evidence_consistency(evidence)
-                validate_evidence_sources(evidence, allowed_pages)
-                if evidence.status != "sufficient":
-                    raise CandidateValidationError("Regeneration did not find sufficient PDF evidence")
-                return {
-                    "status": "grounded",
-                    "answer": evidence.answer,
-                    "sources": [source.model_dump() for source in evidence.sources],
-                }
-            return {
-                "status": "general_knowledge",
-                "answer": generate_general_answer(
-                    client, model_name, question,
-                    request_id=state.get("request_id"),
-                    conversation_id=state.get("conversation_id"),
-                    feedback=feedback,
-                ),
-                "sources": [],
-            }
-
-        reviewed = review_and_repair(
-            result=result, question=question, judge=judge, regenerate=regenerate,
-            chunks=chunks if result["status"] == "grounded" else [],
-            pages=pages if result["status"] == "grounded" else [],
-            allowed_pages=allowed_pages,
-        )
-        if state.get("judge_fallback_attempted"):
-            reviewed["judge_reviews"] = (state.get("judge_reviews") or []) + reviewed["judge_reviews"]
-            reviewed["judge_attempts"] += state.get("judge_attempts", 0)
-            reviewed["judge_regenerations"] += state.get("judge_regenerations", 0)
-        return reviewed
-    return review
-
-
-def route_after_output_guardrail(state: DoubtDeskState) -> str:
-    if state.get("judge_needs_fallback") and not state.get("judge_fallback_attempted"):
-        return "fallback"
-    return "format"
-
-
-def grounded_node(state: DoubtDeskState) -> dict:
-    evidence = state["evidence"]
-    if evidence.status != "sufficient":
-        raise ValueError("Grounded answer requires sufficient evidence")
-    return {
-        "status": "grounded",
-        "answer": evidence.answer,
-        "sources": [source.model_dump() for source in evidence.sources],
-    }
-
-
-def formatting_node(db_path):
-    def format_response(state: DoubtDeskState) -> dict:
-        response = {"status": state["status"], "answer": state["answer"], "sources": state["sources"]}
-        cited_doc_ids = [source["doc_id"] for source in response["sources"]]
-        with closing(sqlite3.connect(db_path)) as conn:
-            document_names = get_document_names(conn, cited_doc_ids, user_id=state["user_id"]) if cited_doc_ids else {}
-        if response["status"] == "grounded":
-            response["answer"] = normalize_answer_citations(response["answer"], response["sources"])
-        return {
-            "answer": response["answer"],
-            "formatted_answer": format_answer(response, document_names, normalized=True),
-        }
-    return format_response
-
-
-def paraphrase_node(client, model_name, embedding_model=None, memory_collection=None):
-    def paraphrase(state: DoubtDeskState) -> dict:
+def aparaphrase_node(client, model_name, embedding_model=None):
+    async def paraphrase(state: DoubtDeskState) -> dict:
         question = state["question"]
         conversation_id = state.get("conversation_id")
-        user_id = state["user_id"]
         history = []
         if conversation_id:
-            history = build_history(
+            history = await abuild_history(
                 conversation_id=conversation_id,
-                user_id=user_id,
+                user_id=state["user_id"],
                 question=question,
                 doc_ids=state.get("doc_ids", []),
                 model=embedding_model,
-                collection=memory_collection,
             )
-        result = resolve_and_paraphrase(
+        result = await aresolve_and_paraphrase(
             client=client,
             model_name=model_name,
             question=question,
@@ -264,6 +128,10 @@ def paraphrase_node(client, model_name, embedding_model=None, memory_collection=
     return paraphrase
 
 
+def paraphrase_node(client, model_name, embedding_model=None):
+    return _sync(aparaphrase_node(client, model_name, embedding_model))
+
+
 def scope_node(classifier):
     def classify(state: DoubtDeskState) -> dict:
         predictions = classifier.predict(state["paraphrases"])
@@ -271,6 +139,14 @@ def scope_node(classifier):
             "scope_predictions": predictions,
             "is_off_topic": all(prediction["label"] == 1 for prediction in predictions),
         }
+    return classify
+
+
+def ascope_node(classifier):
+    sync_classify = scope_node(classifier)
+
+    async def classify(state: DoubtDeskState) -> dict:
+        return await asyncio.to_thread(sync_classify, state)
     return classify
 
 

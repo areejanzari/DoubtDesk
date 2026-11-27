@@ -64,8 +64,10 @@ def test_stream_invalid_citation_regenerates_before_delivering(always_invalid):
         except StopIteration as stop:
             result=stop.value
             break
-    text=''.join(data['text'] for event,data in events if event=='token')
+    last_reset=max((i for i,(event,_) in enumerate(events) if event=='reset'),default=-1)
+    text=''.join(data['text'] for event,data in events[last_reset+1:] if event=='token')
     assert 'INVALID' not in text
+    assert last_reset >= 0
     assert provider.responses.parse.call_count == 1
     if always_invalid:
         assert 'couldn\'t find enough evidence' in text

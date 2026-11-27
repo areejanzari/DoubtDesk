@@ -77,7 +77,7 @@ def test_streamed_grounded_citation_matches_complete_payload(mode, use_judge, tm
         except StopIteration as finished:
             result = finished.value
             break
-    complete = AskResponse.model_validate(streaming.finalize_stream_result(result, str(tmp_path / 'docs.db'), user_id='u'))
+    complete = AskResponse.model_validate(streaming.finalize_stream_result(result, user_id='u'))
     assert ''.join(tokens) == complete.answer == 'Ureotelic animals mainly excrete urea. [1]'
     assert complete.model_dump()['sources'] == SOURCES
     assert 'kebo116.pdf: PDF page(s) 1' in complete.formatted_answer

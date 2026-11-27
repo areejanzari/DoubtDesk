@@ -1,65 +1,21 @@
-from doubtdesk.config import settings
-import sqlite3
-from pathlib import Path
-from contextlib import closing
 import time
-
-
-def initialize_registry(
-    db_path: Path = settings.documents_db,
-) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                doc_id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                sha256 TEXT NOT NULL UNIQUE,
-                page_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'processing', 'completed', 'failed'))
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_documents (
-                user_id TEXT NOT NULL,
-                doc_id TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                attached_at INTEGER NOT NULL,
-                PRIMARY KEY (user_id, doc_id),
-                FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_user_documents_doc
-            ON user_documents(doc_id)
-            """
-        )
-
+from psycopg import Connection
+from psycopg.rows import dict_row
+from doubtdesk.db import connection
 
 
 def register_document(
     doc_id: str,
     filename: str,
     sha256: str,
-    db_path: Path = settings.documents_db,
 ) -> bool:
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with connection() as conn:
         cursor = conn.execute(
             """
-            INSERT OR IGNORE INTO documents
+            INSERT INTO documents
                 (doc_id, filename, sha256)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING
             """,
             (doc_id, filename, sha256),
         )
@@ -69,28 +25,22 @@ def register_document(
 
 def get_document_by_hash(
     sha256: str,
-    db_path: Path = settings.documents_db,
 ) -> dict | None:
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.row_factory = sqlite3.Row
-
-        row = conn.execute(
+    with connection() as conn:
+        return conn.cursor(row_factory=dict_row).execute(
             """
             SELECT doc_id, filename, sha256, page_count, status
             FROM documents
-            WHERE sha256 = ?
+            WHERE sha256 = %s
             """,
             (sha256,),
         ).fetchone()
-
-        return dict(row) if row else None
 
 
 def update_document_status(
     doc_id: str,
     status: str,
     page_count: int,
-    db_path: Path = settings.documents_db,
 ) -> None:
     if status not in {"pending", "processing", "completed", "failed"}:
         raise ValueError(f"Invalid document status: {status}")
@@ -98,12 +48,12 @@ def update_document_status(
     if page_count < 0:
         raise ValueError("Page count cannot be negative")
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with connection() as conn:
         cursor = conn.execute(
             """
             UPDATE documents
-            SET status = ?, page_count = ?
-            WHERE doc_id = ?
+            SET status = %s, page_count = %s
+            WHERE doc_id = %s
             """,
             (status, page_count, doc_id),
         )
@@ -114,9 +64,8 @@ def update_document_status(
 
 def is_document_cached(
     sha256: str,
-    db_path: Path = settings.documents_db,
 ) -> bool:
-    document = get_document_by_hash(sha256, db_path)
+    document = get_document_by_hash(sha256)
 
     if document is None:
         return False
@@ -128,22 +77,20 @@ def is_document_cached(
 
 
 def get_document_page_counts(
-    conn: sqlite3.Connection,
+    conn: Connection,
     doc_ids: list[str],
 ) -> dict[str, int]:
     if not doc_ids:
         return {}
 
-    placeholders = ",".join("?" for _ in doc_ids)
-
     rows = conn.execute(
-        f"""
+        """
         SELECT doc_id, page_count
         FROM documents
-        WHERE doc_id IN ({placeholders})
+        WHERE doc_id = ANY(%s)
           AND status = 'completed'
         """,
-        doc_ids,
+        (list(doc_ids),),
     ).fetchall()
 
     return {
@@ -153,24 +100,22 @@ def get_document_page_counts(
 
 
 def get_document_names(
-    conn: sqlite3.Connection,
+    conn: Connection,
     doc_ids: list[str],
     *, user_id: str,
 ) -> dict[str, str]:
     if not doc_ids:
         return {}
 
-    placeholders = ", ".join("?" for _ in doc_ids)
-
     rows = conn.execute(
-        f"""
+        """
         SELECT d.doc_id, ud.filename
         FROM documents AS d
         JOIN user_documents AS ud ON ud.doc_id = d.doc_id
-        WHERE ud.user_id = ? AND d.doc_id IN ({placeholders})
+        WHERE ud.user_id = %s AND d.doc_id = ANY(%s)
           AND d.status = 'completed'
         """,
-        [user_id, *doc_ids],
+        (user_id, list(doc_ids)),
     ).fetchall()
 
     return {
@@ -180,7 +125,7 @@ def get_document_names(
 
 
 def validate_document_ids(
-    conn: sqlite3.Connection,
+    conn: Connection,
     doc_ids: list[str],
 ) -> None:
     if not doc_ids:
@@ -202,7 +147,7 @@ def validate_document_ids(
 
 
 def list_documents(
-    conn: sqlite3.Connection,
+    conn: Connection,
     user_id: str,
 ) -> list[dict]:
     cursor = conn.execute(
@@ -210,11 +155,13 @@ def list_documents(
         SELECT
             d.doc_id,
             ud.filename,
-            d.page_count
+            d.page_count,
+            (SELECT count(*) FROM pages AS p
+             WHERE p.doc_id = d.doc_id AND p.ocr_status IN ('failed', 'empty')) AS unreadable
         FROM documents AS d
         JOIN user_documents AS ud
             ON d.doc_id = ud.doc_id
-        WHERE ud.user_id = ?
+        WHERE ud.user_id = %s
           AND d.status = 'completed'
           AND d.page_count > 0
         ORDER BY ud.filename
@@ -227,6 +174,7 @@ def list_documents(
             "doc_id": row[0],
             "filename": row[1],
             "page_count": row[2],
+            "unreadable_pages": int(row[3] or 0),
         }
         for row in cursor.fetchall()
     ]
@@ -236,20 +184,19 @@ def attach_document_to_user(
     user_id: str,
     doc_id: str,
     filename: str,
-    db_path: Path = settings.documents_db,
+    *,
+    allow_processing: bool = False,
 ) -> None:
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-
+    with connection() as conn:
         document = conn.execute(
             """
             SELECT doc_id
             FROM documents
-            WHERE doc_id = ?
-              AND status = 'completed'
-              AND page_count > 0
+            WHERE doc_id = %s
+              AND ((status = 'completed' AND page_count > 0)
+                   OR (%s AND status = 'processing'))
             """,
-            (doc_id,),
+            (doc_id, allow_processing),
         ).fetchone()
 
         if document is None:
@@ -263,8 +210,8 @@ def attach_document_to_user(
                 filename,
                 attached_at
             )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id, doc_id)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, doc_id)
             DO UPDATE SET filename = excluded.filename
             """,
             (
@@ -276,7 +223,7 @@ def attach_document_to_user(
         )
 
 def user_can_access_document(
-    conn: sqlite3.Connection,
+    conn: Connection,
     user_id: str,
     doc_id: str,
     page_number: int,
@@ -287,10 +234,10 @@ def user_can_access_document(
         FROM user_documents AS ud
         JOIN documents AS d
             ON ud.doc_id = d.doc_id
-        WHERE ud.user_id = ?
-          AND ud.doc_id = ?
+        WHERE ud.user_id = %s
+          AND ud.doc_id = %s
           AND d.status = 'completed'
-          AND d.page_count >= ?
+          AND d.page_count >= %s
         """,
         (user_id, doc_id, page_number),
     ).fetchone()
@@ -299,7 +246,7 @@ def user_can_access_document(
 
 
 def validate_user_document_ids(
-    conn: sqlite3.Connection,
+    conn: Connection,
     user_id: str,
     doc_ids: list[str],
 ) -> None:
@@ -307,20 +254,19 @@ def validate_user_document_ids(
         return
 
     unique_ids = list(set(doc_ids))
-    placeholders = ",".join("?" for _ in unique_ids)
 
     rows = conn.execute(
-        f"""
+        """
         SELECT d.doc_id
         FROM documents AS d
         JOIN user_documents AS ud
             ON d.doc_id = ud.doc_id
-        WHERE ud.user_id = ?
-          AND d.doc_id IN ({placeholders})
+        WHERE ud.user_id = %s
+          AND d.doc_id = ANY(%s)
           AND d.status = 'completed'
           AND d.page_count > 0
         """,
-        [user_id, *unique_ids],
+        (user_id, unique_ids),
     ).fetchall()
 
     authorized_ids = {row[0] for row in rows}
@@ -335,17 +281,63 @@ class DocumentProcessing(ValueError):
     pass
 
 
-def claim_document_ingestion(doc_id, filename, sha256, *, expected_completed=False, db_path=settings.documents_db):
-    with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT doc_id, status, page_count FROM documents WHERE sha256 = ?", (sha256,)).fetchone()
+STALE_PROCESSING_SECONDS = 600
+
+
+def _is_stale(started_at, now):
+    return started_at is None or now - started_at > STALE_PROCESSING_SECONDS
+
+
+def claim_document_ingestion(doc_id, filename, sha256, *, expected_completed=False):
+    now = int(time.time())
+    with connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"document:{sha256}",))
+        row = conn.execute("SELECT doc_id, status, page_count, processing_started_at FROM documents WHERE sha256 = %s", (sha256,)).fetchone()
         if row is None:
-            conn.execute("INSERT INTO documents (doc_id, filename, sha256, status) VALUES (?, ?, ?, 'processing')", (doc_id, filename, sha256))
+            conn.execute("INSERT INTO documents (doc_id, filename, sha256, status, processing_started_at) VALUES (%s, %s, %s, 'processing', %s)", (doc_id, filename, sha256, now))
             return {"doc_id": doc_id, "status": "processing", "page_count": 0}
-        existing_id, status, page_count = row
-        if status == "processing":
+        existing_id, status, page_count, started_at = row
+        if status == "processing" and not _is_stale(started_at, now):
             raise DocumentProcessing("This PDF is still processing. Try again shortly.")
         if status == "completed" and not expected_completed:
             return {"doc_id": existing_id, "status": status, "page_count": page_count}
-        conn.execute("UPDATE documents SET status = 'processing', page_count = 0 WHERE doc_id = ?", (existing_id,))
+        conn.execute("UPDATE documents SET status = 'processing', page_count = 0, processing_started_at = %s WHERE doc_id = %s", (now, existing_id))
         return {"doc_id": existing_id, "status": "processing", "page_count": 0}
+
+
+def touch_document_ingestion(doc_id: str) -> None:
+    with connection() as conn:
+        conn.execute(
+            "UPDATE documents SET processing_started_at = %s WHERE doc_id = %s AND status = 'processing'",
+            (int(time.time()), doc_id),
+        )
+
+
+def fail_stale_ingestions() -> int:
+    cutoff = int(time.time()) - STALE_PROCESSING_SECONDS
+    with connection() as conn:
+        return conn.execute(
+            """
+            UPDATE documents SET status = 'failed', page_count = 0
+            WHERE status = 'processing'
+              AND (processing_started_at IS NULL OR processing_started_at < %s)
+            """,
+            (cutoff,),
+        ).rowcount
+
+
+def get_user_document_status(conn: Connection, user_id: str, doc_id: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT d.status, d.page_count,
+               (SELECT count(*) FROM pages AS p
+                WHERE p.doc_id = d.doc_id AND p.ocr_status IN ('failed', 'empty'))
+        FROM documents AS d
+        JOIN user_documents AS ud ON ud.doc_id = d.doc_id
+        WHERE ud.user_id = %s AND d.doc_id = %s
+        """,
+        (user_id, doc_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"doc_id": doc_id, "status": row[0], "page_count": row[1], "unreadable_pages": int(row[2] or 0)}

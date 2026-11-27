@@ -1,12 +1,13 @@
 from doubtdesk.config import runtime_settings
 import math
 from functools import lru_cache
-from openai import AsyncOpenAI
+from doubtdesk.llm import bedrock_chat_client
 from ragas.llms import llm_factory
-from ragas.embeddings import embedding_factory
+from ragas.embeddings.huggingface_provider import HuggingFaceEmbeddings
 from ragas.metrics.collections import (
     Faithfulness, AnswerRelevancy, ContextPrecision, ContextRecall, AnswerCorrectness,
 )
+from doubtdesk.ingestion.embeddings import EMBEDDING_MODEL_NAME, OnnxEmbeddingModel
 from doubtdesk.rate_limit import RequestPacer
 
 
@@ -15,24 +16,32 @@ def get_judge_pacer():
     return RequestPacer(runtime_settings().judge_rpm)
 
 
+class SharedHuggingFaceEmbeddings(HuggingFaceEmbeddings):
+    def __init__(self, model_name: str, model_instance):
+        self._shared_instance = model_instance
+        super().__init__(model=model_name)
+
+    def _setup_local_model(self):
+        self.model_instance = self._shared_instance
+
+
+def judge_embeddings(model_name: str, embedding_model=None):
+    if embedding_model is not None and model_name.removeprefix("sentence-transformers/") == EMBEDDING_MODEL_NAME:
+        return SharedHuggingFaceEmbeddings(model_name, embedding_model)
+    repo = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+    return SharedHuggingFaceEmbeddings(model_name, OnnxEmbeddingModel(repo))
+
+
 class RagasJudge:
-    def __init__(self):
-        api_key = runtime_settings().gemini_api_key
-        self.client = AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        )
+    def __init__(self, embedding_model=None):
+        self.client = bedrock_chat_client(runtime_settings(), "running RAGAS evaluations")
         self.llm = llm_factory(
             runtime_settings().ragas_judge_model,
             provider="openai",
             client=self.client,
             adapter="instructor",
         )
-        embeddings = embedding_factory(
-            "huggingface",
-            model=runtime_settings().judge_embed_model,
-            interface="modern",
-        )
+        embeddings = judge_embeddings(runtime_settings().judge_embed_model, embedding_model)
         self.metrics = {
             "context_precision": ContextPrecision(llm=self.llm),
             "context_recall": ContextRecall(llm=self.llm),

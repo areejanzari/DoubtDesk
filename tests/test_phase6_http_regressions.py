@@ -12,16 +12,11 @@ from fastapi.testclient import TestClient
 def http(tmp_path, monkeypatch):
     from doubtdesk.api import routes
     from doubtdesk.auth.dependencies import require_current_user
-    from doubtdesk.memory.store import initialize_memory_db
-    from doubtdesk.ingestion.registry import initialize_registry
     monkeypatch.chdir(tmp_path)
-    initialize_registry()
-    initialize_memory_db()
     app = FastAPI()
     app.include_router(routes.router)
     app.dependency_overrides[require_current_user] = lambda: {'user_id':'u'}
     app.state.embedding_model = Mock()
-    app.state.collection = Mock()
     app.state.graph = Mock()
     app.state.preparation_graph = Mock()
     with TestClient(app) as client:
@@ -32,7 +27,7 @@ def http(tmp_path, monkeypatch):
 def test_pdf_validation_rejects_invalid_inputs(http, monkeypatch, kind):
     client, app, routes = http
     process = Mock()
-    monkeypatch.setattr(routes, 'process_pdf', process)
+    monkeypatch.setattr(routes, 'start_ingestion', process)
     if kind == 'corrupt':
         payload = b'%PDF-invalid-content'
     else:
@@ -53,7 +48,7 @@ def test_pdf_validation_rejects_invalid_inputs(http, monkeypatch, kind):
 def test_processing_document_returns_conflict(http, monkeypatch):
     client, _, routes = http
     from doubtdesk.ingestion.registry import DocumentProcessing
-    monkeypatch.setattr(routes, 'process_pdf', Mock(side_effect=DocumentProcessing('Still processing')))
+    monkeypatch.setattr(routes, 'start_ingestion', Mock(side_effect=DocumentProcessing('Still processing')))
     with pymupdf.open() as pdf:
         pdf.new_page()
         payload=pdf.tobytes()
@@ -82,7 +77,7 @@ def test_pdf_validation_releases_mapping_on_corrupt_upload(http, monkeypatch, tm
     mappings = []
     views = []
     process = Mock()
-    monkeypatch.setattr(routes, 'process_pdf', process)
+    monkeypatch.setattr(routes, 'start_ingestion', process)
     monkeypatch.setattr(routes, 'TemporaryDirectory', lambda: TemporaryDirectory(dir=tmp_path))
 
     def observe_open(*args, **kwargs):

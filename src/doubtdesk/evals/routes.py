@@ -1,14 +1,12 @@
-from doubtdesk.config import settings
-import os
-import sqlite3
-from contextlib import closing
 from uuid import uuid4, UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from doubtdesk.analytics.auth import require_admin_key
+from doubtdesk.config import runtime_settings
+from doubtdesk.db import connection
+from doubtdesk.llm import bedrock_credentials
 from doubtdesk.ingestion.registry import validate_document_ids
 from doubtdesk.evals.schemas import EvalsRequest
 from doubtdesk.evals.store import create_run, get_run
-from doubtdesk.evals.runner import run_evaluation_job
 
 router = APIRouter(
     prefix="/admin/evals", tags=["Admin Evals"],
@@ -18,13 +16,16 @@ router = APIRouter(
 
 @router.post("", status_code=202)
 def create_evaluation(payload: EvalsRequest, background: BackgroundTasks, request: Request):
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured for RAGAS judge")
-    with closing(sqlite3.connect(settings.documents_db)) as conn:
+    try:
+        bedrock_credentials(runtime_settings(), "running RAGAS evaluations")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    with connection() as conn:
         try:
             validate_document_ids(conn, payload.doc_ids)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    from doubtdesk.evals.runner import run_evaluation_job
     run_id = str(uuid4())
     create_run(run_id, payload.mode, len(payload.questions))
     background.add_task(run_evaluation_job, run_id, payload, request.app)

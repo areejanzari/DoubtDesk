@@ -1,99 +1,27 @@
-from doubtdesk.config import settings
-import sqlite3
 import hashlib
 import time
-from contextlib import closing
-from pathlib import Path
+from psycopg import Connection
+from psycopg.rows import dict_row
 from doubtdesk.auth.security import generate_token, hash_token, hash_password
-
-DB_PATH = settings.auth_db
-
-
-def initialize_auth_db(db_path: Path = DB_PATH) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                password_hash TEXT NOT NULL,
-                verified_at INTEGER,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                token_hash TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(user_id),
-                csrf_token TEXT NOT NULL,
-                expires_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_sessions_user
-            ON sessions(user_id);
-
-            CREATE TABLE IF NOT EXISTS action_tokens (
-                token_hash TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(user_id),
-                purpose TEXT NOT NULL CHECK (
-                    purpose IN ('verify', 'reset')
-                ),
-                expires_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_action_tokens_user
-            ON action_tokens(user_id, purpose);
-
-            CREATE TABLE IF NOT EXISTS login_failures (
-                identifier_hash TEXT NOT NULL,
-                ip_address TEXT NOT NULL,
-                attempted_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_login_failures_time
-            ON login_failures(attempted_at);
-
-            CREATE INDEX IF NOT EXISTS idx_login_failures_identifier
-            ON login_failures(identifier_hash, attempted_at);
-
-            CREATE INDEX IF NOT EXISTS idx_login_failures_ip
-            ON login_failures(ip_address, attempted_at);
-
-            CREATE TABLE IF NOT EXISTS auth_attempts (
-                action TEXT NOT NULL, ip_address TEXT NOT NULL,
-                email_hash TEXT NOT NULL, attempted_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_auth_attempts_ip ON auth_attempts(action, ip_address, attempted_at);
-            CREATE INDEX IF NOT EXISTS idx_auth_attempts_email ON auth_attempts(action, email_hash, attempted_at);
-            """
-        )
+from doubtdesk.db import connection
 
 
 def _replace_action_token(conn, user_id, purpose, created_at):
     token = generate_token()
-    conn.execute("DELETE FROM action_tokens WHERE user_id = ? AND purpose = ?", (user_id, purpose))
+    conn.execute("DELETE FROM action_tokens WHERE user_id = %s AND purpose = %s", (user_id, purpose))
     conn.execute("""INSERT INTO action_tokens (token_hash, user_id, purpose, expires_at, created_at)
-                     VALUES (?, ?, ?, ?, ?)""", (hash_token(token), user_id, purpose, created_at + 600, created_at))
+                     VALUES (%s, %s, %s, %s, %s)""", (hash_token(token), user_id, purpose, created_at + 600, created_at))
     return token
 
 
 def create_verification_token(
     user_id: str,
-    db_path: Path = DB_PATH,
 ) -> str:
     created_at = int(time.time())
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-
+    with connection() as conn:
         user = conn.execute(
-            "SELECT verified_at FROM users WHERE user_id = ?",
+            "SELECT verified_at FROM users WHERE user_id = %s FOR UPDATE",
             (user_id,),
         ).fetchone()
 
@@ -110,20 +38,17 @@ def create_verification_token(
 
 def verify_email_token(
     token: str,
-    db_path: Path = DB_PATH,
 ) -> bool:
     token_hash = hash_token(token)
     current_time = int(time.time())
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("BEGIN IMMEDIATE")
-
+    with connection() as conn:
         row = conn.execute(
             """
             SELECT user_id, expires_at
             FROM action_tokens
-            WHERE token_hash = ? AND purpose = 'verify'
+            WHERE token_hash = %s AND purpose = 'verify'
+            FOR UPDATE
             """,
             (token_hash,),
         ).fetchone()
@@ -135,7 +60,7 @@ def verify_email_token(
 
         if expires_at <= current_time:
             conn.execute(
-                "DELETE FROM action_tokens WHERE token_hash = ?",
+                "DELETE FROM action_tokens WHERE token_hash = %s",
                 (token_hash,),
             )
             return False
@@ -143,14 +68,14 @@ def verify_email_token(
         conn.execute(
             """
             UPDATE users
-            SET verified_at = ?
-            WHERE user_id = ? AND verified_at IS NULL
+            SET verified_at = %s
+            WHERE user_id = %s AND verified_at IS NULL
             """,
             (current_time, user_id),
         )
 
         conn.execute(
-            "DELETE FROM action_tokens WHERE token_hash = ?",
+            "DELETE FROM action_tokens WHERE token_hash = %s",
             (token_hash,),
         )
 
@@ -159,19 +84,16 @@ def verify_email_token(
 
 def resend_verification_token(
     email: str,
-    db_path: Path = DB_PATH,
 ) -> str | None:
     current_time = int(time.time())
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("BEGIN IMMEDIATE")
-
+    with connection() as conn:
         user = conn.execute(
             """
             SELECT user_id, verified_at
             FROM users
-            WHERE email = ?
+            WHERE email = %s
+            FOR UPDATE
             """,
             (email,),
         ).fetchone()
@@ -188,7 +110,7 @@ def resend_verification_token(
             """
             SELECT created_at
             FROM action_tokens
-            WHERE user_id = ? AND purpose = 'verify'
+            WHERE user_id = %s AND purpose = 'verify'
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -204,7 +126,7 @@ def resend_verification_token(
         conn.execute(
             """
             DELETE FROM action_tokens
-            WHERE user_id = ? AND purpose = 'verify'
+            WHERE user_id = %s AND purpose = 'verify'
             """,
             (user_id,),
         )
@@ -218,7 +140,7 @@ def resend_verification_token(
                 expires_at,
                 created_at
             )
-            VALUES (?, ?, 'verify', ?, ?)
+            VALUES (%s, %s, 'verify', %s, %s)
             """,
             (
                 hash_token(token),
@@ -233,7 +155,6 @@ def resend_verification_token(
 
 def create_session(
     user_id: str,
-    db_path: Path = DB_PATH,
 ) -> tuple[str, str]:
     session_token = generate_token()
     csrf_token = generate_token()
@@ -241,11 +162,9 @@ def create_session(
     created_at = int(time.time())
     expires_at = created_at + (4 * 60 * 60)
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-
+    with connection() as conn:
         user = conn.execute(
-            "SELECT verified_at FROM users WHERE user_id = ?",
+            "SELECT verified_at FROM users WHERE user_id = %s",
             (user_id,),
         ).fetchone()
 
@@ -261,7 +180,7 @@ def create_session(
                 expires_at,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             """,
             (
                 hash_token(session_token),
@@ -278,65 +197,56 @@ def create_session(
 
 def get_session(
     session_token: str,
-    db_path: Path = DB_PATH,
 ) -> dict | None:
     token_hash = hash_token(session_token)
     current_time = int(time.time())
 
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.row_factory = sqlite3.Row
-
-        session = conn.execute(
+    with connection() as conn:
+        session = conn.cursor(row_factory=dict_row).execute(
             """
             SELECT
                 s.user_id,
                 s.csrf_token,
                 s.expires_at,
-                u.username,
-                u.email
+                u.username::text AS username,
+                u.email::text AS email,
+                u.plan
             FROM sessions AS s
             JOIN users AS u ON s.user_id = u.user_id
-            WHERE s.token_hash = ?
-              AND s.expires_at > ?
+            WHERE s.token_hash = %s
+              AND s.expires_at > %s
               AND u.verified_at IS NOT NULL
             """,
             (token_hash, current_time),
         ).fetchone()
 
-    if session is None:
-        return None
-
-    return dict(session)
+    return session
 
 
 def revoke_session(
     session_token: str,
-    db_path: Path = DB_PATH,
 ) -> None:
     token_hash = hash_token(session_token)
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with connection() as conn:
         conn.execute(
-            "DELETE FROM sessions WHERE token_hash = ?",
+            "DELETE FROM sessions WHERE token_hash = %s",
             (token_hash,),
         )
 
 
 def create_password_reset_token(
     email: str,
-    db_path: Path = DB_PATH,
 ) -> str | None:
     current_time = int(time.time())
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("BEGIN IMMEDIATE")
-
+    with connection() as conn:
         user = conn.execute(
             """
             SELECT user_id, verified_at
             FROM users
-            WHERE email = ?
+            WHERE email = %s
+            FOR UPDATE
             """,
             (email,),
         ).fetchone()
@@ -350,7 +260,7 @@ def create_password_reset_token(
             """
             SELECT created_at
             FROM action_tokens
-            WHERE user_id = ? AND purpose = 'reset'
+            WHERE user_id = %s AND purpose = 'reset'
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -369,20 +279,17 @@ def create_password_reset_token(
 def reset_password(
     token: str,
     new_password: str,
-    db_path: Path = DB_PATH,
 ) -> bool:
     token_hash = hash_token(token)
     current_time = int(time.time())
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("BEGIN IMMEDIATE")
-
+    with connection() as conn:
         row = conn.execute(
             """
             SELECT user_id, expires_at
             FROM action_tokens
-            WHERE token_hash = ? AND purpose = 'reset'
+            WHERE token_hash = %s AND purpose = 'reset'
+            FOR UPDATE
             """,
             (token_hash,),
         ).fetchone()
@@ -394,7 +301,7 @@ def reset_password(
 
         if expires_at <= current_time:
             conn.execute(
-                "DELETE FROM action_tokens WHERE token_hash = ?",
+                "DELETE FROM action_tokens WHERE token_hash = %s",
                 (token_hash,),
             )
             return False
@@ -403,19 +310,19 @@ def reset_password(
         conn.execute(
             """
             UPDATE users
-            SET password_hash = ?
-            WHERE user_id = ? AND verified_at IS NOT NULL
+            SET password_hash = %s
+            WHERE user_id = %s AND verified_at IS NOT NULL
             """,
             (password_hash, user_id),
         )
 
         conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?",
+            "DELETE FROM sessions WHERE user_id = %s",
             (user_id,),
         )
 
         conn.execute(
-            "DELETE FROM action_tokens WHERE user_id = ?",
+            "DELETE FROM action_tokens WHERE user_id = %s",
             (user_id,),
         )
 
@@ -429,7 +336,7 @@ MAX_IP_FAILURES = 20
 
 
 def get_login_identifier_hash(
-    conn: sqlite3.Connection,
+    conn: Connection,
     identifier: str,
 ) -> str:
     normalized = identifier.strip().casefold()
@@ -438,7 +345,7 @@ def get_login_identifier_hash(
         """
         SELECT user_id
         FROM users
-        WHERE username = ? OR email = ?
+        WHERE username = %s OR email = %s
         """,
         (normalized, normalized),
     ).fetchone()
@@ -456,8 +363,8 @@ def _login_counts(conn, identifier_hash, ip_address, cutoff):
         """
         SELECT COUNT(*)
         FROM login_failures
-        WHERE identifier_hash = ?
-          AND attempted_at > ?
+        WHERE identifier_hash = %s
+          AND attempted_at > %s
         """,
         (identifier_hash, cutoff),
     ).fetchone()[0]
@@ -466,8 +373,8 @@ def _login_counts(conn, identifier_hash, ip_address, cutoff):
         """
         SELECT COUNT(*)
         FROM login_failures
-        WHERE ip_address = ?
-          AND attempted_at > ?
+        WHERE ip_address = %s
+          AND attempted_at > %s
         """,
         (ip_address, cutoff),
     ).fetchone()[0]
@@ -477,11 +384,10 @@ def _login_counts(conn, identifier_hash, ip_address, cutoff):
 def is_login_rate_limited(
     identifier: str,
     ip_address: str,
-    db_path: Path = DB_PATH,
 ) -> bool:
     cutoff = int(time.time()) - LOGIN_WINDOW
 
-    with closing(sqlite3.connect(db_path)) as conn:
+    with connection() as conn:
         identifier_hash = get_login_identifier_hash(
             conn, identifier
         )
@@ -497,13 +403,12 @@ def is_login_rate_limited(
 def record_failed_login(
     identifier: str,
     ip_address: str,
-    db_path: Path = DB_PATH,
 ) -> bool:
     now = int(time.time())
     cutoff = now - LOGIN_WINDOW
 
-    with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with connection() as conn:
+        conn.execute("LOCK TABLE login_failures IN SHARE ROW EXCLUSIVE MODE")
 
         identifier_hash = get_login_identifier_hash(
             conn, identifier
@@ -524,7 +429,7 @@ def record_failed_login(
                 ip_address,
                 attempted_at
             )
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
             """,
             (identifier_hash, ip_address, now),
         )
@@ -532,26 +437,24 @@ def record_failed_login(
     return True
 
 
-def cleanup_expired_auth_records(
-    db_path: Path = DB_PATH,
-) -> dict[str, int]:
+def cleanup_expired_auth_records() -> dict[str, int]:
     now = int(time.time())
     login_cutoff = now - LOGIN_WINDOW
 
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with connection() as conn:
         sessions = conn.execute(
-            "DELETE FROM sessions WHERE expires_at <= ?",
+            "DELETE FROM sessions WHERE expires_at <= %s",
             (now,),
         ).rowcount
 
         tokens = conn.execute(
-            "DELETE FROM action_tokens WHERE expires_at <= ?",
+            "DELETE FROM action_tokens WHERE expires_at <= %s",
             (now,),
         ).rowcount
 
-        conn.execute("DELETE FROM auth_attempts WHERE attempted_at <= ?", (login_cutoff,))
+        conn.execute("DELETE FROM auth_attempts WHERE attempted_at <= %s", (login_cutoff,))
         failures = conn.execute(
-            "DELETE FROM login_failures WHERE attempted_at <= ?",
+            "DELETE FROM login_failures WHERE attempted_at <= %s",
             (login_cutoff,),
         ).rowcount
 
@@ -562,15 +465,15 @@ def cleanup_expired_auth_records(
     }
 
 
-def consume_auth_attempt(action, ip_address, email, db_path=DB_PATH):
+def consume_auth_attempt(action, ip_address, email):
     now = int(time.time())
     cutoff = now - LOGIN_WINDOW
     email_hash = hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
-    with closing(sqlite3.connect(db_path, timeout=15)) as conn, conn:
-        conn.execute("BEGIN IMMEDIATE")
-        ip_count = conn.execute("SELECT COUNT(*) FROM auth_attempts WHERE action = ? AND ip_address = ? AND attempted_at > ?", (action, ip_address, cutoff)).fetchone()[0]
-        email_count = conn.execute("SELECT COUNT(*) FROM auth_attempts WHERE action = ? AND email_hash = ? AND attempted_at > ?", (action, email_hash, cutoff)).fetchone()[0]
+    with connection() as conn:
+        conn.execute("LOCK TABLE auth_attempts IN SHARE ROW EXCLUSIVE MODE")
+        ip_count = conn.execute("SELECT COUNT(*) FROM auth_attempts WHERE action = %s AND ip_address = %s AND attempted_at > %s", (action, ip_address, cutoff)).fetchone()[0]
+        email_count = conn.execute("SELECT COUNT(*) FROM auth_attempts WHERE action = %s AND email_hash = %s AND attempted_at > %s", (action, email_hash, cutoff)).fetchone()[0]
         if ip_count >= 20 or email_count >= 5:
             return False
-        conn.execute("INSERT INTO auth_attempts VALUES (?, ?, ?, ?)", (action, ip_address, email_hash, now))
+        conn.execute("INSERT INTO auth_attempts (action, ip_address, email_hash, attempted_at) VALUES (%s, %s, %s, %s)", (action, ip_address, email_hash, now))
     return True

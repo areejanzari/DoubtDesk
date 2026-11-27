@@ -67,7 +67,7 @@ def test_general_answer(client):
     assert result == "Gravity attracts masses."
     client.responses.create.assert_called_once()
     assert client.responses.create.call_args.kwargs["reasoning"] == {"effort": "none"}
-    assert client.responses.create.call_args.kwargs["max_output_tokens"] == 300
+    assert client.responses.create.call_args.kwargs["max_output_tokens"] == 800
 
 
 def test_general_answer_empty_response(client):
@@ -158,7 +158,7 @@ def test_generate_vision_answer(client):
 
     client.responses.parse.assert_called_once()
     assert client.responses.parse.call_args.kwargs["reasoning"] == {"effort": "none"}
-    assert client.responses.parse.call_args.kwargs["max_output_tokens"] == 700
+    assert client.responses.parse.call_args.kwargs["max_output_tokens"] == 1400
 
 
 def test_generate_vision_answer_invalid_response(client):

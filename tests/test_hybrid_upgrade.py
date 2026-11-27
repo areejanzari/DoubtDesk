@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from doubtdesk.retrieval.hybrid import reciprocal_rank_fusion
 from doubtdesk.memory.store import (
-    initialize_memory_db, claim_or_check_conversation, save_exchange,
+    claim_or_check_conversation, save_exchange,
     ConversationLimitReached, delete_user_conversation,
     list_user_conversations, get_user_recent_exchanges,
 )
@@ -21,21 +21,19 @@ def test_rrf_merges_dense_and_bm25_without_duplicate_chunks():
 
 
 def test_conversation_limit_preserves_existing_history_and_rejects_new(tmp_path):
-    db_path = tmp_path / "conversations.db"
-    initialize_memory_db(db_path)
-    assert claim_or_check_conversation("first", "u", db_path, max_conversations=2)
-    save_exchange("first", "first question", "first answer", [], "grounded", db_path, user_id="u")
-    assert claim_or_check_conversation("second", "u", db_path, max_conversations=2)
-    assert claim_or_check_conversation("first", "u", db_path, max_conversations=2)
+    assert claim_or_check_conversation("first", "u", max_conversations=2)
+    save_exchange("first", "first question", "first answer", [], "grounded", user_id="u")
+    assert claim_or_check_conversation("second", "u", max_conversations=2)
+    assert claim_or_check_conversation("first", "u", max_conversations=2)
 
     with pytest.raises(ConversationLimitReached, match="2-conversation limit"):
-        claim_or_check_conversation("third", "u", db_path, max_conversations=2)
+        claim_or_check_conversation("third", "u", max_conversations=2)
 
-    assert {row["conversation_id"] for row in list_user_conversations("u", db_path)} == {"first", "second"}
-    assert get_user_recent_exchanges("first", "u", db_path=db_path)[0]["answer"] == "first answer"
-    assert delete_user_conversation("second", "u", db_path)
-    assert claim_or_check_conversation("third", "u", db_path, max_conversations=2)
-    assert not claim_or_check_conversation("second", "u", db_path, max_conversations=2)
+    assert {row["conversation_id"] for row in list_user_conversations("u")} == {"first", "second"}
+    assert get_user_recent_exchanges("first", "u")[0]["answer"] == "first answer"
+    assert delete_user_conversation("second", "u")
+    assert claim_or_check_conversation("third", "u", max_conversations=2)
+    assert not claim_or_check_conversation("second", "u", max_conversations=2)
 
 
 def test_eval_requires_five_questions():

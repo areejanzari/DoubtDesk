@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from doubtdesk.api.schemas import PlanUpdate
+from doubtdesk.quotas import set_user_plan
 from doubtdesk.analytics.auth import require_admin_key
 from doubtdesk.analytics.queries import (
     get_usage_overview,
@@ -43,3 +45,10 @@ def admin_daily_usage(
         "days": days,
         "data": get_daily_usage(days=days),
     }
+
+
+@router.patch("/users/{user_id}/plan")
+def admin_set_user_plan(user_id: str, payload: PlanUpdate):
+    if not set_user_plan(user_id, payload.plan):
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"user_id": user_id, "plan": payload.plan}

@@ -1,25 +1,15 @@
-from doubtdesk.config import settings
-from chromadb.api.models.Collection import Collection
+from doubtdesk.retrieval.vector_store import document_has_chunks
+from doubtdesk.storage.images import existing_page_numbers
 
 def cached_artifacts_exist(
     doc_id: str,
     page_count: int,
-    collection: Collection,
 ) -> bool:
     if page_count <= 0:
         return False
 
-    image_dir = settings.page_image_dir / doc_id
+    present = existing_page_numbers(doc_id)
+    if any(page_number not in present for page_number in range(1, page_count + 1)):
+        return False
 
-    for page_number in range(1, page_count + 1):
-        image_path = image_dir / f"page_{page_number:03}.png"
-
-        if not image_path.is_file():
-            return False
-
-    records = collection.get(
-        where={"doc_id": doc_id},
-        include=[],
-    )
-
-    return len(records["ids"]) > 0
+    return document_has_chunks(doc_id)

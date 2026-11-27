@@ -1,134 +1,25 @@
 import logging
-import sqlite3
-from pathlib import Path
-from doubtdesk.analytics.store import DB_PATH
+import psycopg
+from doubtdesk.db import connection
 
 logger = logging.getLogger(__name__)
 
 
-def record_gemini_usage(
-    *,
-    response,
-    request_id: str,
-    conversation_id: str | None,
-    operation: str,
-    model: str,
-    latency_ms: int,
-    pacer_wait_ms: int | None = None,
-    db_path: Path = DB_PATH,
-) -> None:
-    usage = getattr(response, "usage_metadata", None)
-
-
-    try:
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO ai_usage (
-                    request_id,
-                    conversation_id,
-                    operation,
-                    model,
-                    prompt_tokens,
-                    output_tokens,
-                    thinking_tokens,
-                    cached_tokens,
-                    total_tokens,
-                    latency_ms,
-                    status, provider, pacer_wait_ms
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gemini', ?)
-                """,
-                (
-                    request_id,
-                    conversation_id,
-                    operation,
-                    model,
-                    getattr(usage, "prompt_token_count", None),
-                    getattr(usage, "candidates_token_count", None),
-                    getattr(usage, "thoughts_token_count", None),
-                    getattr(usage, "cached_content_token_count", None),
-                    getattr(usage, "total_token_count", None),
-                    latency_ms,
-                    "success",
-                    pacer_wait_ms,
-                ),
-            )
-    except sqlite3.Error:
-        logger.exception("Failed to save Gemini usage analytics")
-
-
-def record_gemini_failure(
-    *,
-    request_id: str,
-    conversation_id: str | None,
-    operation: str,
-    model: str,
-    latency_ms: int,
-    error_type: str,
-    response=None,
-    pacer_wait_ms: int | None = None,
-    db_path: Path = DB_PATH,
-) -> None:
-    usage = getattr(response, "usage_metadata", None)
-
-    def token_count(field: str):
-        return getattr(usage, field, None)
-
-    try:
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO ai_usage (
-                    request_id,
-                    conversation_id,
-                    operation,
-                    model,
-                    prompt_tokens,
-                    output_tokens,
-                    thinking_tokens,
-                    cached_tokens,
-                    total_tokens,
-                    latency_ms,
-                    status,
-                    error_type, provider, pacer_wait_ms
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gemini', ?)
-                """,
-                (
-                    request_id,
-                    conversation_id,
-                    operation,
-                    model,
-                    token_count("prompt_token_count"),
-                    token_count("candidates_token_count"),
-                    token_count("thoughts_token_count"),
-                    token_count("cached_content_token_count"),
-                    token_count("total_token_count"),
-                    latency_ms,
-                    "error",
-                    error_type,
-                    pacer_wait_ms,
-                ),
-            )
-    except sqlite3.Error:
-        logger.exception("Failed to save Gemini error analytics.")
-
 def record_openai_usage(*, response, request_id, conversation_id=None, operation, model,
-                        latency_ms=None, db_path=DB_PATH):
+                        latency_ms=None):
     usage = getattr(response, "usage", None)
     if usage is None or not request_id:
         return
     input_details = getattr(usage, "input_tokens_details", None)
     output_details = getattr(usage, "output_tokens_details", None)
     try:
-        with sqlite3.connect(db_path) as conn:
+        with connection() as conn:
             conn.execute(
                 """INSERT INTO ai_usage
                     (request_id, conversation_id, operation, model, prompt_tokens,
                      output_tokens, thinking_tokens, cached_tokens, total_tokens,
                      latency_ms, status, provider)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', 'openai')""",
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success', 'openai')""",
                 (
                     request_id, conversation_id, operation, model,
                     getattr(usage, "input_tokens", None),
@@ -138,5 +29,49 @@ def record_openai_usage(*, response, request_id, conversation_id=None, operation
                     getattr(usage, "total_tokens", None), latency_ms,
                 ),
             )
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("Failed to record OpenAI usage")
+
+
+def _anthropic_usage_row(response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None, None, None, None
+    prompt = getattr(usage, "input_tokens", None)
+    if prompt is None:
+        prompt = getattr(usage, "prompt_tokens", None)
+    output = getattr(usage, "output_tokens", None)
+    if output is None:
+        output = getattr(usage, "completion_tokens", None)
+    cached = getattr(usage, "cache_read_input_tokens", None)
+    total = (prompt or 0) + (output or 0) if prompt is not None or output is not None else None
+    return prompt, output, cached, total
+
+
+def record_anthropic_usage(*, response, request_id, conversation_id=None, operation, model,
+                           latency_ms=None, pacer_wait_ms=None, provider="bedrock", status="success",
+                           error_type=None):
+    if not request_id:
+        return
+    prompt, output, cached, total = _anthropic_usage_row(response)
+    try:
+        with connection() as conn:
+            conn.execute(
+                """INSERT INTO ai_usage
+                    (request_id, conversation_id, operation, model, prompt_tokens,
+                     output_tokens, cached_tokens, total_tokens, latency_ms, status,
+                     error_type, provider, pacer_wait_ms)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (request_id, conversation_id, operation, model, prompt, output, cached, total,
+                 latency_ms, status, error_type, provider, pacer_wait_ms),
+            )
+    except psycopg.Error:
+        logger.exception("Failed to record Anthropic usage")
+
+
+def record_anthropic_failure(*, request_id, conversation_id=None, operation, model, latency_ms,
+                             error_type, response=None, pacer_wait_ms=None, provider="bedrock"):
+    record_anthropic_usage(response=response, request_id=request_id, conversation_id=conversation_id,
+                           operation=operation, model=model, latency_ms=latency_ms,
+                           pacer_wait_ms=pacer_wait_ms, provider=provider, status="error",
+                           error_type=error_type)

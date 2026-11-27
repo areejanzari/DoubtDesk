@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from doubtdesk.api.streaming import stream_answer
 from doubtdesk.answering.output_guardrails import JudgeVerdict
@@ -54,6 +54,11 @@ def verdict(passed):
     )
 
 
+def visible_text(events):
+    last_reset = max((index for index, event in enumerate(events) if event[0] == "reset"), default=-1)
+    return "".join(event[1]["text"] for event in events[last_reset + 1:] if event[0] == "token")
+
+
 def collect(generator):
     events = []
     while True:
@@ -63,25 +68,31 @@ def collect(generator):
             return events, finish.value
 
 
-def test_stream_requires_judge_approval_before_tokens():
+def test_stream_tokens_arrive_before_judge_check_and_are_kept_on_approval():
     openai = FakeOpenAI("Correct response")
     judge = FakeJudge([verdict(True)])
     events, result = collect(stream_answer({"question": "What is gravity?", "doc_ids": []}, openai, "openai-model", judge=judge))
-    assert events[0] == ("status", {"stage": "checking"})
+    kinds = [event[0] for event in events]
+    assert events[0] == ("status", {"stage": "verifying"})
+    assert kinds.index("token") < events.index(("status", {"stage": "checking"}))
+    assert "reset" not in kinds
     assert "".join(x[1]["text"] for x in events if x[0] == "token") == "Correct response"
     assert result["judge_passed"] is True
-    assert openai.calls[0]["max_output_tokens"] == 300
+    assert openai.calls[0]["max_output_tokens"] == 800
     assert judge.calls == 1
 
 
 def test_stream_rejected_answer_is_never_released():
     openai = FakeOpenAI("WRONG FIRST ANSWER")
     judge = FakeJudge([verdict(False), verdict(True)])
-    with patch("doubtdesk.api.streaming.generate_general_answer", return_value="Fixed correct answer") as regenerate:
+    with patch("doubtdesk.api.streaming.agenerate_general_answer", new_callable=AsyncMock, return_value="Fixed correct answer") as regenerate:
         events, result = collect(stream_answer({"question": "Question", "doc_ids": []}, openai, "openai-model", judge=judge))
-    tokens = "".join(x[1]["text"] for x in events if x[0] == "token")
+    tokens = visible_text(events)
     assert tokens == "Fixed correct answer"
     assert "WRONG" not in tokens
+    reset_at = next(index for index, event in enumerate(events) if event[0] == "reset")
+    assert events[reset_at + 1] == ("status", {"stage": "revising"})
+    assert result["answer"] == "Fixed correct answer"
     assert result["judge_attempts"] == 2
     assert judge.calls == 2
     assert regenerate.call_args.kwargs["feedback"] == "Repair the answer"
@@ -90,11 +101,11 @@ def test_stream_rejected_answer_is_never_released():
 def test_stream_failed_judge_fails_closed_and_leaks_nothing():
     openai = FakeOpenAI("Potentially bad answer")
     judge = FakeJudge([verdict(False), verdict(False)])
-    with patch("doubtdesk.api.streaming.generate_general_answer", return_value="Still invalid"):
+    with patch("doubtdesk.api.streaming.agenerate_general_answer", new_callable=AsyncMock, return_value="Still invalid"):
         events, result = collect(stream_answer({"question": "Question", "doc_ids": []}, openai, "openai-model", judge=judge))
-    tokens = "".join(x[1]["text"] for x in events if x[0] == "token")
-    assert tokens != "Still invalid"
-    assert tokens != "Potentially bad answer"
+    tokens = visible_text(events)
+    assert "Still invalid" not in tokens
+    assert "Potentially bad answer" not in tokens
     assert result["judge_passed"] is False
 
 
@@ -131,10 +142,10 @@ def test_stream_low_non_pdf_question_uses_only_general_generation():
     assert judge.calls == 1
 
 
-def test_stream_gemini_http_503_yields_truthful_verification_failure():
+def test_stream_judge_http_503_yields_truthful_verification_failure():
     class UnavailableJudge:
         def evaluate(self, **kwargs):
-            error = RuntimeError("Gemini high demand")
+            error = RuntimeError("Judge high demand")
             error.code = 503
             raise error
 
@@ -143,9 +154,10 @@ def test_stream_gemini_http_503_yields_truthful_verification_failure():
         {"question": "What is gravity?", "doc_ids": []},
         openai, "openai-model", judge=UnavailableJudge(),
     ))
-    tokens = "".join(x[1]["text"] for x in events if x[0] == "token")
+    tokens = visible_text(events)
     assert "Potential answer" not in tokens
     assert "verification is temporarily unavailable" in tokens
+    assert any(event[0] == "reset" for event in events)
     assert result["judge_attempts"] == 1
     assert result["judge_failure_reason"] == "judge_unavailable"
     assert result["judge_needs_fallback"] is False
@@ -163,22 +175,20 @@ def test_stream_rejected_grounded_uses_vetted_general_fallback():
         "evidence_pages": [{"doc_id":"docA", "page_number":1}],
     }
     with (
-        patch("doubtdesk.api.streaming.generate_vision_answer", return_value=SimpleNamespace(
+        patch("doubtdesk.api.streaming.agenerate_vision_answer", new_callable=AsyncMock, return_value=SimpleNamespace(
             status="sufficient", answer="STILL UNVERIFIED", sources=[SimpleNamespace(
                 doc_id="docA", page_numbers=[1], model_dump=lambda: {"doc_id":"docA", "page_numbers":[1]}
             )],
         )),
-        patch("doubtdesk.api.streaming.stream_general", side_effect=lambda *args, **kw: (yield from fake_general()))
+        patch("doubtdesk.api.streaming.astream_general", new=fake_general)
     ):
         events, result = collect(stream_answer(prepared, openai, "openai-model", judge=judge))
-    tokens = "".join(e[1]["text"] for e in events if e[0] == "token")
+    tokens = visible_text(events)
     assert tokens == "Fallback explanation"
     assert result["status"] == "general_knowledge"
     assert result["judge_fallback_attempted"]
     assert "UNVERIFIED" not in tokens
 
 
-def fake_general():
-    if False:
-        yield None
-    return {"status": "general_knowledge", "answer": "Fallback explanation", "sources": []}
+async def fake_general(*args, **kwargs):
+    yield ("result", {"status": "general_knowledge", "answer": "Fallback explanation", "sources": []})

@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import Mock
@@ -9,22 +8,20 @@ def test_central_runtime_settings_keep_existing_env_names(monkeypatch):
     monkeypatch.setenv('OUTPUT_JUDGE_ENABLED', 'false')
     monkeypatch.setenv('EVIDENCE_TEXT_THRESHOLD', '0.85')
     monkeypatch.setenv('OUTPUT_JUDGE_RPM', '10')
-    monkeypatch.setenv('DOCUMENTS_DB', 'new-storage/docs.db')
+    monkeypatch.setenv('DATABASE_URL', 'postgresql://app@db.internal:5432/doubtdesk')
     config = runtime_settings()
     assert not config.output_judge_enabled
     assert config.evidence_text_threshold == .85
     assert config.output_judge_rpm == 10
-    assert config.documents_db == Path('new-storage/docs.db')
+    assert config.database_url == 'postgresql://app@db.internal:5432/doubtdesk'
     assert Settings(_env_file=None, output_judge_enabled=True).output_judge_enabled
 
 
 def test_legacy_saved_footer_uses_current_owners_filename(tmp_path, monkeypatch):
     from doubtdesk.conversations.routes import get_conversation
-    from doubtdesk.memory.store import initialize_memory_db, claim_or_check_conversation, save_exchange
-    from doubtdesk.ingestion.registry import initialize_registry, register_document, update_document_status, attach_document_to_user
+    from doubtdesk.memory.store import claim_or_check_conversation, save_exchange
+    from doubtdesk.ingestion.registry import register_document, update_document_status, attach_document_to_user
     monkeypatch.chdir(tmp_path)
-    initialize_memory_db()
-    initialize_registry()
     doc = str(uuid4())
     chat = uuid4()
     register_document(doc, 'first-user-private.pdf', 'hash')

@@ -10,9 +10,8 @@ def clean_env(monkeypatch, tmp_path):
         "APP_ENV",
         "OPENAI_API_KEY",
         "OPENAI_MODEL",
-        "GEMINI_API_KEY",
         "RAGAS_JUDGE_MODEL",
-        "CHROMA_PATH",
+        "DATABASE_URL",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -22,26 +21,23 @@ def test_default_settings(clean_env):
     assert config.app_env == "development"
     assert config.openai_api_key == ""
     assert config.openai_model == "gpt-6-luna"
-    assert config.gemini_api_key == ""
-    assert config.ragas_judge_model == "gemini-3.1-flash-lite"
-    assert config.chroma_path == Path("data/chroma")
+    assert config.ragas_judge_model == "qwen.qwen3-235b-a22b-2507"
+    assert config.database_url == "postgresql://doubtdesk:doubtdesk@127.0.0.1:5432/doubtdesk"
 
 
 def test_environment_variables(clean_env, monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("OPENAI_API_KEY", "test_openai_key")
     monkeypatch.setenv("OPENAI_MODEL", "test-openai-model")
-    monkeypatch.setenv("GEMINI_API_KEY", "test_gemini_key")
     monkeypatch.setenv("RAGAS_JUDGE_MODEL", "test-eval-model")
-    monkeypatch.setenv("CHROMA_PATH", "custom/chroma")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://app:secret@10.0.0.5:5432/doubtdesk")
 
     config = Settings()
     assert config.app_env == "production"
     assert config.openai_api_key == "test_openai_key"
     assert config.openai_model == "test-openai-model"
-    assert config.gemini_api_key == "test_gemini_key"
     assert config.ragas_judge_model == "test-eval-model"
-    assert config.chroma_path == Path("custom/chroma")
+    assert config.database_url == "postgresql://app:secret@10.0.0.5:5432/doubtdesk"
 
 
 def test_dotenv_file(clean_env, tmp_path):
@@ -70,8 +66,8 @@ def test_extra_environment_values_ignored(clean_env, tmp_path):
     assert not hasattr(config, "unused_setting")
 
 
-def test_custom_chroma_path(clean_env, monkeypatch):
-    monkeypatch.setenv("CHROMA_PATH", "storage/vectors")
+def test_custom_page_image_dir(clean_env, monkeypatch):
+    monkeypatch.setenv("PAGE_IMAGE_DIR", "storage/pages")
     config = Settings()
-    assert isinstance(config.chroma_path, Path)
-    assert config.chroma_path == Path("storage/vectors")
+    assert isinstance(config.page_image_dir, Path)
+    assert config.page_image_dir == Path("storage/pages")

@@ -310,6 +310,8 @@ def test_regeneration_is_on_same_trace_without_duplicate_accounting(trace_captur
             for event, data in stream_answer({"question": "Gravity?", "doc_ids": []}, provider, "fake", "request", "chat", judge=judge):
                 if event == "token":
                     yield data["text"]
+                elif event == "reset":
+                    yield "|reset|"
 
     async def run():
         response = ContextStreamingResponse(content())
@@ -325,7 +327,7 @@ def test_regeneration_is_on_same_trace_without_duplicate_accounting(trace_captur
     assert len(generations) == len(checks) == 2
     assert all(span.parent.span_id == root.context.span_id for span in generations + checks)
     assert {trace_capture.data[span.context.span_id]["output"] for span in generations} == {"Rejected answer", "Repaired answer"}
-    assert b"".join(delivered) == b"Repaired answer"
+    assert b"".join(delivered) == b"Rejected answer|reset|Repaired answer"
     assert tracking.call_count == 2
 
 

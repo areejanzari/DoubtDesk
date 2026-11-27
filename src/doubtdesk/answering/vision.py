@@ -1,13 +1,17 @@
+import asyncio
 import base64
 import re
 from pydantic import ValidationError
 from pathlib import Path
 from doubtdesk.answering.schemas import EvidenceResult, ModelEvidenceResult
 from doubtdesk.answering.validation import validate_evidence_consistency
+from doubtdesk.answering.json_stream import citation_keys_in_order
+from doubtdesk.llm import acall
 from doubtdesk.observability.tracing import observe_llm_response, trace_generation
 
 
-STRUCTURED_ANSWER_MAX_OUTPUT_TOKENS = 700
+STRUCTURED_ANSWER_MAX_OUTPUT_TOKENS = 1400
+INLINE_ALIAS_PATTERN = re.compile(r"\(\s*(S\d+)\s*\)", re.IGNORECASE)
 
 
 class CandidateValidationError(RuntimeError):
@@ -18,7 +22,8 @@ SYSTEM_PROMPT = (
     "You are DoubtDesk, an academic tutor. Determine whether the supplied PDF text "
     "and, if provided, page images contain enough evidence to answer the student's question. "
     "Use only supplied PDF evidence. If sufficient, set status=sufficient, answer clearly "
-    "in 300 output tokens or fewer and cite only supplied source aliases. "
+    "and concisely (about 250 output tokens; up to 600 for derivations or multi-step numerical problems, "
+    "showing each step) and cite only supplied source aliases. "
     "If insufficient, set status=insufficient, answer='', sources=[]. "
     "For each inline citation, use its supplied short alias, such as (S1). "
     "Return the cited aliases as strings in sources, such as [\"S1\", \"S2\"]. Never use a bare PDF page reference. "
@@ -34,10 +39,13 @@ def build_vision_content(question: str, pages: list[dict]) -> list[dict]:
         raise ValueError("At least one page is required")
     content = [{"type": "input_text", "text": f"Student question: {question}"}]
     for page in pages:
-        image_path = Path(page["image_path"])
-        if not image_path.is_file():
-            raise FileNotFoundError(f"Page image not found: {image_path}")
-        image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        image_bytes = page.get("image_bytes")
+        if image_bytes is None:
+            image_path = Path(page["image_path"])
+            if not image_path.is_file():
+                raise FileNotFoundError(f"Page image not found: {image_path}")
+            image_bytes = image_path.read_bytes()
+        image_data = base64.b64encode(image_bytes).decode("ascii")
         content.append({
             "type": "input_text",
             "text": f"Document ID: {page['doc_id']}, PDF page number: {page['page_number']}",
@@ -94,15 +102,19 @@ def decode_model_evidence(payload, aliases):
         if isinstance(payload, EvidenceResult) and not payload.sources:
             payload = payload.model_dump()
         parsed = ModelEvidenceResult.model_validate(payload)
-        grouped = {}
         for alias in parsed.sources:
             if alias not in aliases:
                 raise ValueError(f"Unknown source alias: {alias}")
-            doc_id, page = aliases[alias]
-            if page not in grouped.setdefault(doc_id, []):
-                grouped[doc_id].append(page)
-        sources = [{"doc_id": doc, "page_numbers": pages} for doc, pages in grouped.items()]
-        indices = {key: index for index, key in enumerate(((doc, p) for doc, pages in grouped.items() for p in pages), 1)}
+        listed = {aliases[alias] for alias in parsed.sources}
+        inline = [key for key in citation_keys_in_order(parsed.answer, aliases) if key in listed]
+        keys = list(dict.fromkeys(inline + [aliases[alias] for alias in parsed.sources]))
+        sources = []
+        for doc_id, page in keys:
+            if sources and sources[-1]["doc_id"] == doc_id:
+                sources[-1]["page_numbers"].append(page)
+            else:
+                sources.append({"doc_id": doc_id, "page_numbers": [page]})
+        indices = {key: index for index, key in enumerate(keys, 1)}
 
         def replace(match):
             alias = match.group(1).upper()
@@ -110,7 +122,7 @@ def decode_model_evidence(payload, aliases):
                 raise ValueError(f"Unknown or unlisted inline source alias: {alias}")
             return f"[{indices[aliases[alias]]}]"
 
-        answer = re.sub(r"\(\s*(S\d+)\s*\)", replace, parsed.answer, flags=re.IGNORECASE)
+        answer = INLINE_ALIAS_PATTERN.sub(replace, parsed.answer)
         result = EvidenceResult(status=parsed.status, answer=answer, sources=sources)
         validate_evidence_consistency(result)
         return result
@@ -128,6 +140,33 @@ def vision_input(content: list[dict], feedback: str | None = None) -> list[dict]
     ]
 
 
+def _vision_request(model_name: str, content: list[dict], feedback: str | None):
+    if not content:
+        raise ValueError("Content cannot be empty")
+    aliased_content, aliases = alias_grounded_content(content)
+    return {
+        "model": model_name,
+        "input": vision_input(aliased_content, feedback),
+        "text_format": ModelEvidenceResult,
+        "reasoning": {"effort": "none"},
+        "max_output_tokens": STRUCTURED_ANSWER_MAX_OUTPUT_TOKENS,
+    }, aliases
+
+
+def _vision_error(exc: Exception) -> Exception | None:
+    if isinstance(exc, ValidationError):
+        return CandidateValidationError("Invalid or truncated structured evidence")
+    if type(exc).__name__ in {"LengthFinishReasonError", "ContentFilterFinishReasonError"}:
+        return CandidateValidationError("Incomplete structured evidence")
+    return None
+
+
+def _vision_result(response, aliases) -> EvidenceResult:
+    if getattr(response, "status", None) == "incomplete" or response.output_parsed is None:
+        raise CandidateValidationError("No structured evidence returned or response was incomplete")
+    return decode_model_evidence(response.output_parsed, aliases)
+
+
 def generate_vision_answer(
     client,
     model_name: str,
@@ -137,25 +176,36 @@ def generate_vision_answer(
     operation: str = "grounded_generation",
     feedback: str | None = None,
 ) -> EvidenceResult:
-    if not content:
-        raise ValueError("Content cannot be empty")
-    aliased_content, aliases = alias_grounded_content(content)
+    request, aliases = _vision_request(model_name, content, feedback)
     with trace_generation(operation, model_name, request_id, input={"content_items": len(content), "regeneration": bool(feedback)}):
         try:
-            response = client.responses.parse(
-                model=model_name,
-                input=vision_input(aliased_content, feedback),
-                text_format=ModelEvidenceResult,
-                reasoning={"effort": "none"},
-                max_output_tokens=STRUCTURED_ANSWER_MAX_OUTPUT_TOKENS,
-            )
-        except ValidationError as exc:
-            raise CandidateValidationError("Invalid or truncated structured evidence") from exc
+            response = client.responses.parse(**request)
         except Exception as exc:
-            if type(exc).__name__ in {"LengthFinishReasonError", "ContentFilterFinishReasonError"}:
-                raise CandidateValidationError("Incomplete structured evidence") from exc
-            raise
+            translated = _vision_error(exc)
+            if translated is None:
+                raise
+            raise translated from exc
         observe_llm_response(operation, response, model_name, request_id, conversation_id)
-    if getattr(response, "status", None) == "incomplete" or response.output_parsed is None:
-        raise CandidateValidationError("No structured evidence returned or response was incomplete")
-    return decode_model_evidence(response.output_parsed, aliases)
+    return _vision_result(response, aliases)
+
+
+async def agenerate_vision_answer(
+    client,
+    model_name: str,
+    content: list[dict],
+    request_id: str | None = None,
+    conversation_id: str | None = None,
+    operation: str = "grounded_generation",
+    feedback: str | None = None,
+) -> EvidenceResult:
+    request, aliases = _vision_request(model_name, content, feedback)
+    with trace_generation(operation, model_name, request_id, input={"content_items": len(content), "regeneration": bool(feedback)}):
+        try:
+            response = await acall(client.responses.parse, **request)
+        except Exception as exc:
+            translated = _vision_error(exc)
+            if translated is None:
+                raise
+            raise translated from exc
+        await asyncio.to_thread(observe_llm_response, operation, response, model_name, request_id, conversation_id)
+    return _vision_result(response, aliases)

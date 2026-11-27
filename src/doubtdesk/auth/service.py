@@ -1,25 +1,23 @@
-import sqlite3
 import time
-from contextlib import closing
-from pathlib import Path
 from uuid import uuid4
+import psycopg
+from psycopg.rows import dict_row
 from doubtdesk.auth.schemas import SignupRequest
 from doubtdesk.auth.security import hash_password, verify_password
-from doubtdesk.auth.store import DB_PATH
+from doubtdesk.db import connection
 
 DUMMY_PASSWORD_HASH = '$argon2id$v=19$m=65536,t=3,p=4$LPSC2j7Xy54ovZJndwnF6A$Skiafz8somdqy8NCud/CcIyf2pQumj1QTQVitQtjE88'
 
 
 def register_user(
     payload: SignupRequest,
-    db_path: Path = DB_PATH,
 ) -> dict:
     user_id = str(uuid4())
     password_hash = hash_password(payload.password)
     created_at = int(time.time())
 
     try:
-        with closing(sqlite3.connect(db_path)) as conn, conn:
+        with connection() as conn:
             conn.execute(
                 """
                 INSERT INTO users (
@@ -30,7 +28,7 @@ def register_user(
                     verified_at,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     user_id,
@@ -42,7 +40,7 @@ def register_user(
                 ),
             )
 
-    except sqlite3.IntegrityError as exc:
+    except psycopg.errors.UniqueViolation as exc:
         raise ValueError(
             "Username or email already registered."
         ) from exc
@@ -58,16 +56,13 @@ def register_user(
 def authenticate_user(
     identifier: str,
     password: str,
-    db_path: Path = DB_PATH,
 ) -> dict | None:
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.row_factory = sqlite3.Row
-
-        user = conn.execute(
+    with connection() as conn:
+        user = conn.cursor(row_factory=dict_row).execute(
             """
-            SELECT user_id, username, email, password_hash, verified_at
+            SELECT user_id, username::text AS username, email::text AS email, password_hash, verified_at
             FROM users
-            WHERE username = ? OR email = ?
+            WHERE username = %s OR email = %s
             """,
             (identifier.strip(), identifier.strip()),
         ).fetchone()

@@ -1,5 +1,6 @@
 from doubtdesk.config import settings
 from pathlib import Path
+from doubtdesk.storage.images import read_page_image
 
 def get_page_image_paths(
     pages: list[dict],
@@ -10,6 +11,15 @@ def get_page_image_paths(
     for page in pages:
         doc_id = page["doc_id"]
         page_number = page["page_number"]
+
+        if settings.storage_backend == "s3":
+            image_bytes = read_page_image(doc_id, page_number)
+            results.append({
+                "doc_id": doc_id,
+                "page_number": page_number,
+                "image_bytes": image_bytes,
+            })
+            continue
 
         image_path = (
             image_root / doc_id

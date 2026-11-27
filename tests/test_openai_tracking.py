@@ -1,4 +1,3 @@
-import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,8 +6,8 @@ import pytest
 from doubtdesk.answering.fallback import generate_general_answer
 from doubtdesk.answering.schemas import EvidenceResult
 from doubtdesk.answering.vision import generate_vision_answer
-from doubtdesk.analytics.store import initialize_analytics_db
 from doubtdesk.analytics.tracker import record_openai_usage
+from doubtdesk.db import connection
 from doubtdesk.guardrails.paraphrasing import resolve_and_paraphrase
 from doubtdesk.observability.tracing import observe_llm_response
 
@@ -137,9 +136,7 @@ def test_vision_missing_structured_output_is_rejected():
     track.assert_called_once_with("grounded_generation", response, "test-model", "request_009", None)
 
 
-def test_openai_response_usage_is_recorded(tmp_path):
-    db_path = tmp_path / "analytics.db"
-    initialize_analytics_db(db_path)
+def test_openai_response_usage_is_recorded():
     response = SimpleNamespace(usage=SimpleNamespace(
         input_tokens=120,
         output_tokens=35,
@@ -155,12 +152,11 @@ def test_openai_response_usage_is_recorded(tmp_path):
         operation="paraphrasing",
         model="test-model",
         latency_ms=90,
-        db_path=db_path,
     )
 
-    with sqlite3.connect(db_path) as conn:
+    with connection() as conn:
         row = conn.execute(
-            "SELECT prompt_tokens, output_tokens, thinking_tokens, cached_tokens, total_tokens, latency_ms, status FROM ai_usage WHERE request_id = ?",
+            "SELECT prompt_tokens, output_tokens, thinking_tokens, cached_tokens, total_tokens, latency_ms, status FROM ai_usage WHERE request_id = %s",
             ("request_010",),
         ).fetchone()
     assert row == (120, 35, 4, 15, 155, 90, "success")

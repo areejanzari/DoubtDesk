@@ -1,4 +1,4 @@
-import { streamResponse } from './test/mockStream'
+import { eventsResponse, revisedStreamEvents, streamResponse } from './test/mockStream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -119,6 +119,38 @@ expect(fetch).toHaveBeenCalledWith(
     expect(call[1]!.body).toBeInstanceOf(FormData)
   })
 
+  it.each([
+    ['completed', 'sample.pdf: uploaded (3 pages).'],
+    ['failed', 'sample.pdf: processing failed. Please try uploading again.'],
+  ])('polls a background upload until it is %s', async (finalStatus, message) => {
+    let statusCalls = 0
+    const fallback = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/documents/upload')) return response({ status: 'processing', filename: 'sample.pdf', page_count: 0, doc_id: 'pdf_303' }, 202)
+      if (url.endsWith('/documents/pdf_303/status')) {
+        statusCalls += 1
+        if (statusCalls < 2) return response({ doc_id: 'pdf_303', status: 'processing', page_count: 0 })
+        if (finalStatus === 'completed') documents = [{ doc_id: 'pdf_303', filename: 'sample.pdf', page_count: 3 }]
+        return response({ doc_id: 'pdf_303', status: finalStatus, page_count: finalStatus === 'completed' ? 3 : 0 })
+      }
+      return fallback(input, init)
+    })
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      await openTutor()
+      fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [new File(['%PDF-1.4'], 'sample.pdf', { type: 'application/pdf' })] } })
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Processing sample.pdf'))
+      await vi.advanceTimersByTimeAsync(4100)
+      await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(message))
+      expect(statusCalls).toBe(2)
+      if (finalStatus === 'completed') expect(await screen.findByText('3 pages')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /Upload PDF/ })).not.toBeDisabled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('blocks invalid uploads before calling the API', async () => {
     await openTutor()
     fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [new File(['hi'], 'invalid.txt')] } })
@@ -159,6 +191,66 @@ expect(fetch).toHaveBeenCalledWith(
     await user.type(screen.getByPlaceholderText('Ask a follow-up question…'), 'Explain?')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     expect(await screen.findByText('One or more documents are unavailable.')).toBeInTheDocument()
+  })
+
+  it('shows streamed text as verifying until the answer is approved', async () => {
+    documents = [DOC]
+    const final = {
+      status: 'grounded', answer: 'Plants use light [1].', formatted_answer: '',
+      sources: [{ doc_id: 'pdf_101', page_numbers: [3] }], conversation_id: null,
+    }
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const baseImpl = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation(async (input, init) => String(input).endsWith('/ask/stream')
+      ? eventsResponse([
+        ['status', { stage: 'generating' }],
+        ['status', { stage: 'verifying' }],
+        ['token', { text: 'Plants use ' }],
+        ['token', { text: 'light [1].' }],
+        ['status', { stage: 'checking' }],
+        ['complete', final],
+      ], { gate, gateAfter: 5 })
+      : baseImpl(input, init))
+    const user = userEvent.setup()
+    await openTutor()
+    await user.click(await screen.findByRole('checkbox'))
+    await user.type(screen.getByPlaceholderText('Ask a follow-up question…'), 'Explain photosynthesis')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Verifying')).toBeInTheDocument()
+    expect(screen.getByText(/Plants use light/)).toBeInTheDocument()
+    expect(screen.getByText(/Plants use light/).closest('article')).toHaveAttribute('aria-busy', 'true')
+    expect(screen.queryByRole('button', { name: /Copy answer/ })).not.toBeInTheDocument()
+    expect(screen.queryByText('Sources')).not.toBeInTheDocument()
+    release()
+    expect(await screen.findByText('From documents')).toBeInTheDocument()
+    expect(screen.queryByText('Verifying')).not.toBeInTheDocument()
+    expect(screen.getByText('Sources')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Copy answer/ })).toBeInTheDocument()
+  })
+
+  it('clears a rejected answer and restreams the revised one', async () => {
+    const final = {
+      status: 'general_knowledge', answer: 'Revised answer.', formatted_answer: '',
+      sources: [], conversation_id: null,
+    }
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const events = revisedStreamEvents('Rejected draft.', final)
+    const baseImpl = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation(async (input, init) => String(input).endsWith('/ask/stream')
+      ? eventsResponse(events, { gate, gateAfter: 7 })
+      : baseImpl(input, init))
+    const user = userEvent.setup()
+    await openTutor()
+    await user.type(screen.getByPlaceholderText('Ask a follow-up question…'), 'Explain?')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Revising')).toBeInTheDocument()
+    expect(screen.queryByText('Rejected draft.')).not.toBeInTheDocument()
+    release()
+    expect(await screen.findByText('Revised answer.')).toBeInTheDocument()
+    expect(screen.getByText('Not from document')).toBeInTheDocument()
+    expect(screen.queryByText('Rejected draft.')).not.toBeInTheDocument()
   })
 
   it('shows source citations without public image URLs', async () => {
