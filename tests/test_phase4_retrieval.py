@@ -1,17 +1,16 @@
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 from types import SimpleNamespace
 import numpy as np
 from doubtdesk.ingestion.schemas import ChunkRecord
-from doubtdesk.retrieval.lexical_store import replace_document_chunks, lexical_candidates
+from doubtdesk.db import EMBEDDING_DIMENSIONS
+from doubtdesk.retrieval.lexical_store import lexical_candidates
+from doubtdesk.retrieval.vector_store import replace_document_chunks
 
 
-def test_stopwords_do_not_create_irrelevant_matches(tmp_path):
-    db=tmp_path/'fts.db'
-    replace_document_chunks('d',[ChunkRecord(doc_id='d',page_number=1,chunk_index=0,text='the is a'),ChunkRecord(doc_id='d',page_number=2,chunk_index=0,text='photosynthesis converts energy')],db)
-    assert [r['page_number'] for r in lexical_candidates(['what is the photosynthesis'],['d'],db_path=db)[0]] == [2]
-    assert lexical_candidates(['the is'],['d'],db_path=db)[0][0]['page_number']==1
-    with patch('doubtdesk.retrieval.lexical_store.initialize_lexical_index', side_effect=AssertionError('DDL in query')):
-        assert lexical_candidates(['photosynthesis'],['d'],db_path=db)[0]
+def test_stopwords_do_not_create_irrelevant_matches():
+    replace_document_chunks('d',[ChunkRecord(doc_id='d',page_number=1,chunk_index=0,text='the is a'),ChunkRecord(doc_id='d',page_number=2,chunk_index=0,text='photosynthesis converts energy')],np.ones((2,EMBEDDING_DIMENSIONS)))
+    assert [r['page_number'] for r in lexical_candidates(['what is the photosynthesis'],['d'])[0]] == [2]
+    assert lexical_candidates(['the is'],['d'])[0][0]['page_number']==1
 
 
 def test_dynamic_scope_batches_and_matches_fixed_batch():

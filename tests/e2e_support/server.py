@@ -1,29 +1,28 @@
-import chromadb
 import os
-import sqlite3
 import tempfile
 import time
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from pathlib import Path
+
+os.environ["DATABASE_URL"] = os.environ.get(
+    "E2E_DATABASE_URL",
+    "postgresql://doubtdesk:doubtdesk@127.0.0.1:5432/doubtdesk_e2e",
+)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from doubtdesk.analytics.store import initialize_analytics_db
 from doubtdesk.api.routes import router
 from doubtdesk.auth.routes import router as auth_router
 from doubtdesk.auth.schemas import SignupRequest
 from doubtdesk.auth.service import register_user
-from doubtdesk.auth.store import initialize_auth_db
+from doubtdesk.db import close_pool, connection, initialize_database
 from doubtdesk.graph.builder import build_preparation_graph
 from doubtdesk.api.streaming import PreparedAnswerGraph
 from doubtdesk.ingestion.embeddings import load_embedding_model
-from doubtdesk.ingestion.registry import initialize_registry
-from doubtdesk.memory.store import initialize_memory_db
-from doubtdesk.retrieval.vector_store import get_collection
+from tests.db_support import ensure_database, reset_database
 from tests.e2e_support.fake_openai import FakeOpenAIClient, FakeOutputJudge
 from doubtdesk.conversations.routes import router as conversations_router
-from doubtdesk.memory.vector import get_memory_collection
 
 
 test_directory = tempfile.TemporaryDirectory(
@@ -48,10 +47,9 @@ class FakeScopeClassifier:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    initialize_registry()
-    initialize_memory_db()
-    initialize_analytics_db()
-    initialize_auth_db()
+    ensure_database(os.environ["DATABASE_URL"])
+    initialize_database()
+    reset_database(os.environ["DATABASE_URL"])
 
     test_user = register_user(
         SignupRequest(
@@ -60,27 +58,22 @@ async def lifespan(app: FastAPI):
             password="e2e-password-123",
         )
     )
-    with closing(sqlite3.connect("data/auth.db")) as conn, conn:
+    with connection() as conn:
         conn.execute(
-            "UPDATE users SET verified_at = ? WHERE user_id = ?",
+            "UPDATE users SET verified_at = %s WHERE user_id = %s",
             (int(time.time()), test_user["user_id"]),
         )
 
     app.state.embedding_model = load_embedding_model()
-    app.state.chroma_client = chromadb.PersistentClient(path="data/chroma")
-    app.state.collection = get_collection(client=app.state.chroma_client)
     app.state.llm_client = FakeOpenAIClient()
     app.state.output_judge = FakeOutputJudge()
     app.state.model_name = "fake-openai"
-    app.state.memory_collection = get_memory_collection(client=app.state.chroma_client)
     app.state.scope_classifier = FakeScopeClassifier()
     app.state.preparation_graph = build_preparation_graph(
-        collection=app.state.collection,
         embedding_model=app.state.embedding_model,
         client=app.state.llm_client,
         model_name=app.state.model_name,
         scope_classifier=app.state.scope_classifier,
-        memory_collection=app.state.memory_collection,
     )
     app.state.graph = PreparedAnswerGraph(app.state.preparation_graph, app.state.llm_client,
                                           app.state.model_name, app.state.output_judge)
@@ -89,6 +82,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         app.state.llm_client.close()
+        close_pool()
 
 
 app = FastAPI(lifespan=lifespan)

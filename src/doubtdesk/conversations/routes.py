@@ -1,11 +1,9 @@
-from contextlib import closing
-import sqlite3
-from doubtdesk.config import settings
+from doubtdesk.db import connection
 from doubtdesk.ingestion.registry import get_document_names
 from doubtdesk.answering.formatting import format_answer
 import logging
 from uuid import UUID, uuid4
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from doubtdesk.auth.dependencies import require_current_user
 from doubtdesk.conversations.schemas import (
     ConversationDetail,
@@ -20,7 +18,6 @@ from doubtdesk.memory.store import (
     list_user_conversations,
     rename_user_conversation,
 )
-from doubtdesk.memory.vector import delete_session_memories
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
@@ -55,7 +52,7 @@ def get_conversation(
     grounded = [message for message in result["messages"] if message["status"] == "grounded" and message["sources"]]
     if grounded:
         doc_ids = list(dict.fromkeys(source["doc_id"] for message in grounded for source in message["sources"]))
-        with closing(sqlite3.connect(settings.documents_db)) as conn:
+        with connection() as conn:
             names = get_document_names(conn, doc_ids, user_id=user["user_id"])
         names = {doc_id: names.get(doc_id, "Unavailable document") for doc_id in doc_ids}
         for message in grounded:
@@ -87,15 +84,8 @@ def rename_conversation(
 @router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_conversation(
     conversation_id: UUID,
-    request: Request,
     user: dict = Depends(require_current_user),
 ):
     deleted = delete_user_conversation(str(conversation_id), user["user_id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="Conversation not found.")
-    try:
-        delete_session_memories(
-            [str(conversation_id)], collection=request.app.state.memory_collection
-        )
-    except Exception:
-        logger.exception("Failed to remove conversation vector memory after SQLite deletion")

@@ -9,6 +9,24 @@ jobs:
     name: Backend Tests
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: doubtdesk
+          POSTGRES_PASSWORD: doubtdesk
+          POSTGRES_DB: doubtdesk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U doubtdesk"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://doubtdesk:doubtdesk@127.0.0.1:5432/doubtdesk_test
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -61,6 +79,24 @@ jobs:
   e2e:
     name: Playwright Tests
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: doubtdesk
+          POSTGRES_PASSWORD: doubtdesk
+          POSTGRES_DB: doubtdesk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U doubtdesk"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      E2E_DATABASE_URL: postgresql://doubtdesk:doubtdesk@127.0.0.1:5432/doubtdesk_e2e
 
     defaults:
       run:

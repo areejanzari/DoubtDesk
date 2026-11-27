@@ -8,6 +8,7 @@ from doubtdesk.ingestion.pdf_reader import render_pdf_pages
 from doubtdesk.ingestion.pipeline import ingest_document
 from doubtdesk.ingestion.service import process_pdf
 from doubtdesk.ingestion.cache import cached_artifacts_exist
+from doubtdesk.storage.images import page_image_exists
 
 
 @pytest.fixture
@@ -29,7 +30,6 @@ def sample_pdf(tmp_path):
 @pytest.fixture
 def service_mocks():
     with (
-        patch("doubtdesk.ingestion.service.initialize_registry"),
         patch(
             "doubtdesk.ingestion.service.calculate_sha256",
             return_value="hash_001",
@@ -61,12 +61,8 @@ def service_mocks():
             return_value=[[0.1, 0.2]],
         ),
         patch(
-            "doubtdesk.ingestion.service.delete_document_chunks"
-        ) as delete_chunks,
-        patch(
-            "doubtdesk.ingestion.service.store_chunks"
-        ) as store,
-        patch("doubtdesk.ingestion.service.replace_document_chunks"),
+            "doubtdesk.ingestion.service.replace_document_chunks"
+        ) as replace,
     ):
         yield {
             "get_document": get_document,
@@ -74,9 +70,14 @@ def service_mocks():
             "attach": attach,
             "update_status": update_status,
             "ingest": ingest,
-            "delete_chunks": delete_chunks,
-            "store": store,
+            "replace": replace,
         }
+
+@pytest.fixture
+def has_chunks():
+    with patch("doubtdesk.ingestion.cache.document_has_chunks", return_value=False) as mock:
+        yield mock
+
 
 def test_sha256_hash(tmp_path):
     file_path = tmp_path / "sample.txt"
@@ -138,12 +139,12 @@ def test_ingest_document(sample_pdf, tmp_path, monkeypatch):
     )
 
     assert all(
-        Path(record.image_path).is_file()
+        page_image_exists(record.doc_id, record.page_number)
         for record in records
     )
 
 def test_successful_ingestion(service_mocks):
-    result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
+    result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock())
 
     assert result["status"] == "completed"
     assert result["page_count"] == 2
@@ -160,8 +161,7 @@ def test_successful_ingestion(service_mocks):
         result["doc_id"], "completed", 2
     )
 
-    service_mocks["delete_chunks"].assert_called_once()
-    service_mocks["store"].assert_called_once()
+    service_mocks["replace"].assert_called_once_with(result["doc_id"], ["chunk1"], [[0.1, 0.2]])
 
 
 def test_cached_document(service_mocks):
@@ -177,7 +177,7 @@ def test_cached_document(service_mocks):
             return_value=True,
         ),
     ):
-        result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
+        result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock())
 
     assert result == {
         "doc_id": "doc_001",
@@ -192,7 +192,7 @@ def test_cached_document(service_mocks):
         *service_mocks["attach"].call_args.args,
         *service_mocks["attach"].call_args.kwargs.values(),
     )
-    service_mocks["store"].assert_not_called()
+    service_mocks["replace"].assert_not_called()
 
 def test_ingestion_failure(service_mocks):
     service_mocks["ingest"].side_effect = RuntimeError(
@@ -200,7 +200,7 @@ def test_ingestion_failure(service_mocks):
     )
 
     with pytest.raises(RuntimeError, match="PDF extraction failed"):
-        process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
+        process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock())
 
     doc_id = service_mocks["register"].call_args.args[0]
 
@@ -208,7 +208,7 @@ def test_ingestion_failure(service_mocks):
         doc_id, "failed", 0
     )
 
-    service_mocks["store"].assert_not_called()
+    service_mocks["replace"].assert_not_called()
     service_mocks["attach"].assert_not_called()
 
 
@@ -217,50 +217,47 @@ def test_empty_chunks(service_mocks):
         "doubtdesk.ingestion.service.chunk_document",
         return_value=[],
     ):
-        result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock(), collection=MagicMock())
+        result = process_pdf(Path("biology.pdf"), user_id="user_A", embedding_model=MagicMock())
 
     assert result["status"] == "completed"
-    service_mocks["delete_chunks"].assert_called_once()
-    service_mocks["store"].assert_not_called()
+    service_mocks["replace"].assert_called_once()
+    assert service_mocks["replace"].call_args.args[1] == []
 
 
 @pytest.mark.parametrize("page_count", [0, -1])
-def test_cache_invalid_page_count(tmp_path, monkeypatch, page_count):
+def test_cache_invalid_page_count(tmp_path, monkeypatch, has_chunks, page_count):
     monkeypatch.chdir(tmp_path)
-    collection = MagicMock()
 
-    result = cached_artifacts_exist("doc1", page_count, collection)
+    result = cached_artifacts_exist("doc1", page_count)
 
     assert result is False
-    collection.get.assert_not_called()
+    has_chunks.assert_not_called()
 
 
-def test_cache_missing_image_directory(tmp_path, monkeypatch):
+def test_cache_missing_image_directory(tmp_path, monkeypatch, has_chunks):
     monkeypatch.chdir(tmp_path)
-    collection = MagicMock()
 
-    result = cached_artifacts_exist("doc1", 2, collection)
+    result = cached_artifacts_exist("doc1", 2)
 
     assert result is False
-    collection.get.assert_not_called()
+    has_chunks.assert_not_called()
 
 
-def test_cache_missing_page_image(tmp_path, monkeypatch):
+def test_cache_missing_page_image(tmp_path, monkeypatch, has_chunks):
     monkeypatch.chdir(tmp_path)
 
     image_dir = tmp_path / "data/page_images/doc1"
     image_dir.mkdir(parents=True)
     (image_dir / "page_001.png").write_bytes(b"image")
 
-    collection = MagicMock()
 
-    result = cached_artifacts_exist("doc1", 2, collection)
+    result = cached_artifacts_exist("doc1", 2)
 
     assert result is False
-    collection.get.assert_not_called()
+    has_chunks.assert_not_called()
 
 
-def test_cache_missing_embeddings(tmp_path, monkeypatch):
+def test_cache_missing_embeddings(tmp_path, monkeypatch, has_chunks):
     monkeypatch.chdir(tmp_path)
 
     image_dir = tmp_path / "data/page_images/doc1"
@@ -269,19 +266,14 @@ def test_cache_missing_embeddings(tmp_path, monkeypatch):
     for page_number in range(1, 3):
         (image_dir / f"page_{page_number:03}.png").write_bytes(b"image")
 
-    collection = MagicMock()
-    collection.get.return_value = {"ids": []}
 
-    result = cached_artifacts_exist("doc1", 2, collection)
+    result = cached_artifacts_exist("doc1", 2)
 
     assert result is False
-    collection.get.assert_called_once_with(
-        where={"doc_id": "doc1"},
-        include=[],
-    )
+    has_chunks.assert_called_once_with("doc1")
 
 
-def test_cache_valid_artifacts(tmp_path, monkeypatch):
+def test_cache_valid_artifacts(tmp_path, monkeypatch, has_chunks):
     monkeypatch.chdir(tmp_path)
 
     image_dir = tmp_path / "data/page_images/doc1"
@@ -290,20 +282,14 @@ def test_cache_valid_artifacts(tmp_path, monkeypatch):
     for page_number in range(1, 3):
         (image_dir / f"page_{page_number:03}.png").write_bytes(b"image")
 
-    collection = MagicMock()
-    collection.get.return_value = {"ids": ["chunk1", "chunk2"]}
-
-    result = cached_artifacts_exist("doc1", 2, collection)
+    has_chunks.return_value = True
+    result = cached_artifacts_exist("doc1", 2)
 
     assert result is True
-    collection.get.assert_called_once_with(
-        where={"doc_id": "doc1"},
-        include=[],
-    )
+    has_chunks.assert_called_once_with("doc1")
 
 def test_reuses_provided_embedding_model(service_mocks):
     model = MagicMock()
-    collection = MagicMock()
 
     with (
         patch("doubtdesk.ingestion.service.embed_chunks") as embed,
@@ -312,7 +298,6 @@ def test_reuses_provided_embedding_model(service_mocks):
             Path("biology.pdf"),
             user_id="user_A",
             embedding_model=model,
-            collection=collection,
         )
 
     assert result["status"] == "completed"

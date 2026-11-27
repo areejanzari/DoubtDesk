@@ -1,7 +1,5 @@
 import smtplib
-import sqlite3
 import time
-from contextlib import closing
 
 import pytest
 from argon2 import PasswordHasher
@@ -9,7 +7,8 @@ from argon2.low_level import Type
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from doubtdesk.auth import dependencies, routes, security, store
+from doubtdesk.auth import dependencies, routes, security
+from doubtdesk.db import connection
 
 
 @pytest.fixture
@@ -22,7 +21,6 @@ def auth_client(tmp_path, monkeypatch):
         "password_hasher",
         PasswordHasher(time_cost=1, memory_cost=1024, parallelism=1, type=Type.ID),
     )
-    store.initialize_auth_db()
     sent_verification = []
     sent_reset = []
 
@@ -71,8 +69,9 @@ def login(client, identifier="student_a", password="original-password"):
 
 
 def sql(sql_text, args=()):
-    with closing(sqlite3.connect(store.DB_PATH)) as conn, conn:
-        return conn.execute(sql_text, args).fetchall()
+    with connection() as conn:
+        cursor = conn.execute(sql_text, args)
+        return cursor.fetchall() if cursor.description else []
 
 
 def test_signup_creates_unverified_account_and_sets_no_session(auth_client):
@@ -85,7 +84,7 @@ def test_signup_creates_unverified_account_and_sets_no_session(auth_client):
     assert "password" not in data
     assert verifications[0][0] == "student_a@example.com"
     assert "doubtdesk_session" not in client.cookies
-    assert sql("SELECT verified_at FROM users WHERE user_id = ?", (data["user_id"],)) == [(None,)]
+    assert sql("SELECT verified_at FROM users WHERE user_id = %s", (data["user_id"],)) == [(None,)]
 
 
 def test_signup_duplicate_username_and_email_rejected(auth_client):
@@ -129,7 +128,7 @@ def test_verify_email_invalid_expired_and_replay(auth_client):
     assert client.post("/auth/verify-email", json={"token": token}).status_code == 400
     assert signup(client, "other_user", "other@example.com").status_code == 201
     expired = sent[-1][1]
-    sql("UPDATE action_tokens SET expires_at = 0 WHERE token_hash = ?", (security.hash_token(expired),))
+    sql("UPDATE action_tokens SET expires_at = 0 WHERE token_hash = %s", (security.hash_token(expired),))
     assert client.post("/auth/verify-email", json={"token": expired}).status_code == 400
 
 

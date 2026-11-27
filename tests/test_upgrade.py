@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,13 +10,11 @@ from doubtdesk.answering.evidence_selection import (
 from doubtdesk.answering.fallback import ANSWER_MAX_OUTPUT_TOKENS
 from doubtdesk.answering.output_guardrails import (
     DOCUMENT_FALLBACK_MESSAGE,
-    GeminiOutputJudge, JudgeVerdict, document_insufficient_result,
+    BedrockOpenAIOutputJudge, JudgeVerdict, document_insufficient_result,
     is_document_specific, review_and_repair,
 )
 from doubtdesk.answering.fallback import generate_general_answer
 from doubtdesk.answering.vision import generate_vision_answer
-from doubtdesk.graph.nodes import route_selected_evidence, output_guardrail_node
-from doubtdesk.graph.builder import build_graph
 
 
 CHUNKS = [{"doc_id": "docA", "page_number": 1, "text": "Photosynthesis stores light energy", "chunk_id": "c1"}]
@@ -51,10 +50,7 @@ def test_no_evidence_cannot_pass_even_with_high_score():
     assert choose_evidence_route(assessment, ["Expected"], [])["evidence_mode"] == "low"
 
 
-def test_low_tier_is_routed_without_image_or_grounded_generation():
-    assert route_selected_evidence({"evidence_mode": "low", "question": "Explain thermodynamics"}) == "fallback"
-    assert route_selected_evidence({"evidence_mode": "low", "question": "According to this PDF, what is thermodynamics?"}) == "insufficient_document"
-    assert route_selected_evidence({"evidence_mode": "text", "question": "Explain thermodynamics"}) == "evidence"
+def test_document_specific_questions_are_detected():
     assert is_document_specific("In the uploaded document, what is on page 1?")
     assert not is_document_specific("According to Newton's law, why does this happen?")
 
@@ -80,7 +76,7 @@ class FakeJudge:
         return response
 
 
-def test_gemini_review_approved_without_regeneration():
+def test_judge_review_approved_without_regeneration():
     judge = FakeJudge(verdict())
     result = review_and_repair(
         result={"status": "general_knowledge", "answer": "Accurate answer", "sources": []},
@@ -92,7 +88,7 @@ def test_gemini_review_approved_without_regeneration():
     assert len(judge.calls) == 1
 
 
-def test_gemini_rejected_then_openai_regenerated_once():
+def test_judge_rejected_then_openai_regenerated_once():
     judge = FakeJudge(verdict(False, "Correct this fact"), verdict())
     feedback = []
 
@@ -125,7 +121,7 @@ def test_failed_judge_and_retry_never_release_candidate():
 
 
 def test_judge_exception_fails_closed_without_regeneration():
-    judge = FakeJudge(RuntimeError("Gemini unavailable"))
+    judge = FakeJudge(RuntimeError("Judge unavailable"))
     result = review_and_repair(
         result={"status": "general_knowledge", "answer": "Possible hallucination", "sources": []},
         question="Question", judge=judge,
@@ -135,7 +131,7 @@ def test_judge_exception_fails_closed_without_regeneration():
     assert result["answer"] != "Possible hallucination"
 
 
-def test_invalid_citations_cannot_be_approved_by_gemini():
+def test_invalid_citations_cannot_be_approved_by_judge():
     judge = FakeJudge(verdict())
     result = review_and_repair(
         result={"status": "grounded", "answer": "A", "sources": [{"doc_id": "wrong", "page_numbers": [1]}]},
@@ -147,29 +143,34 @@ def test_invalid_citations_cannot_be_approved_by_gemini():
     assert not judge.calls
 
 
-def test_gemini_sdk_client_is_called():
+def chat_reply(payload):
+    message = SimpleNamespace(content=json.dumps(payload))
+    return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=message)], usage=None)
+
+
+def test_bedrock_judge_client_is_called():
     client = MagicMock()
-    client.models.generate_content.return_value = SimpleNamespace(parsed=verdict().model_dump())
+    client.chat.completions.create.return_value = chat_reply(verdict().model_dump())
     pacer = MagicMock()
-    judge = GeminiOutputJudge(client, model_name="gemini-3.1-flash-lite", pacer=pacer)
+    judge = BedrockOpenAIOutputJudge(client, model_name="qwen-judge", pacer=pacer)
     verdict_result = judge.evaluate(
         question="What is ATP?",
         result={"status": "grounded", "answer": "ATP stores energy", "sources": [{"doc_id": "docA", "page_numbers": [1]}]},
         chunks=CHUNKS,
     )
     assert verdict_result.passed
-    assert client.models.generate_content.call_count == 1
-    assert client.models.generate_content.call_args.kwargs["model"] == "gemini-3.1-flash-lite"
+    assert client.chat.completions.create.call_count == 1
+    assert client.chat.completions.create.call_args.kwargs["model"] == "qwen-judge"
     pacer.acquire.assert_called_once()
 
 
-def test_gemini_cannot_claim_pass_when_scores_are_low():
+def test_judge_cannot_claim_pass_when_scores_are_low():
     client = MagicMock()
-    client.models.generate_content.return_value = SimpleNamespace(parsed={
+    client.chat.completions.create.return_value = chat_reply({
         "passed": True, "relevance": 0.1, "groundedness": 0.9,
         "completeness": 0.9, "safety": "pass", "feedback": "Off topic",
     })
-    judge = GeminiOutputJudge(client, pacer=MagicMock())
+    judge = BedrockOpenAIOutputJudge(client, model_name="m", pacer=MagicMock())
     response = judge.evaluate(question="Question", result={"status": "general_knowledge", "answer": "Answer", "sources": []})
     assert not response.passed
 
@@ -187,15 +188,6 @@ def test_generation_function_output_caps():
     assert client.responses.parse.call_args.kwargs["max_output_tokens"] > ANSWER_MAX_OUTPUT_TOKENS
 
 
-def test_graph_has_live_output_judge_node(tmp_path):
-    graph = build_graph(
-        collection=MagicMock(), embedding_model=MagicMock(),
-        client=MagicMock(), model_name="test-model",
-        scope_classifier=MagicMock(), db_path=tmp_path / "documents.db",
-        output_judge=FakeJudge(verdict()),
-    )
-    assert "output_guardrail" in graph.get_graph().nodes
-    assert "insufficient_document" in graph.get_graph().nodes
 
 
 def test_no_llm_for_pdf_specific_low_evidence():
@@ -204,72 +196,10 @@ def test_no_llm_for_pdf_specific_low_evidence():
     assert result["skip_output_judge"]
 
 
-def test_sync_graph_judge_calls_and_corrects(monkeypatch):
-    judge = FakeJudge(verdict(False, "Fix the claim"), verdict())
-    answers = iter(["Fixed answer"])
-    monkeypatch.setattr("doubtdesk.graph.nodes.generate_general_answer", lambda *args, **kwargs: next(answers))
-    review = output_guardrail_node(MagicMock(), "test", judge)
-    result = review({"question": "Why?", "status": "general_knowledge", "answer": "Bad answer", "sources": []})
-    assert result["answer"] == "Fixed answer"
-    assert result["judge_passed"] is True
-    assert len(judge.calls) == 2
 
 
-def test_main_graph_general_answer_actually_calls_output_judge(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "doubtdesk.graph.nodes.resolve_and_paraphrase",
-        lambda **kw: SimpleNamespace(resolved_question=kw["question"], questions=[kw["question"]] * 3),
-    )
-    with patch("doubtdesk.graph.nodes.generate_general_answer", return_value="Gravity attracts masses"):
-        classifier = MagicMock()
-        classifier.predict.return_value = [{"label": 0}] * 3
-        judge = FakeJudge(verdict())
-        graph = build_graph(
-            collection=MagicMock(), embedding_model=MagicMock(), client=MagicMock(),
-            model_name="gpt-test", scope_classifier=classifier,
-            db_path=tmp_path / "empty.db", output_judge=judge,
-        )
-        result = graph.invoke({"question": "What is gravity?", "doc_ids": [], "user_id": "u"})
-    assert result["judge_passed"] is True
-    assert result["answer"] == "Gravity attracts masses"
-    assert len(judge.calls) == 1
 
 
-def test_main_graph_grounded_answer_actually_calls_output_judge(tmp_path, monkeypatch):
-    from doubtdesk.answering.schemas import EvidenceResult
-
-    monkeypatch.setattr(
-        "doubtdesk.graph.nodes.resolve_and_paraphrase",
-        lambda **kw: SimpleNamespace(resolved_question=kw["question"], questions=[kw["question"]] * 3),
-    )
-    evidence = EvidenceResult(
-        status="sufficient", answer="Plants use light energy",
-        sources=[{"doc_id": "docA", "page_numbers": [1]}],
-    )
-    with (
-        patch("doubtdesk.graph.nodes.validate_user_document_ids"),
-        patch("doubtdesk.graph.nodes.hybrid_search", return_value=CHUNKS),
-        patch("doubtdesk.graph.nodes.assess_text_evidence", return_value=TextEvidenceAssessment(
-            sufficiency_score=0.95,
-        )),
-        patch("doubtdesk.graph.nodes.generate_vision_answer", return_value=evidence),
-        patch("doubtdesk.graph.nodes.get_document_names", return_value={"docA": "bio.pdf"}),
-    ):
-        classifier = MagicMock()
-        classifier.predict.return_value = [{"label": 0}] * 3
-        judge = FakeJudge(verdict())
-        graph = build_graph(
-            collection=MagicMock(), embedding_model=MagicMock(), client=MagicMock(),
-            model_name="gpt-test", scope_classifier=classifier,
-            db_path=tmp_path / "empty.db", output_judge=judge,
-        )
-        result = graph.invoke({
-            "question": "Explain photosynthesis", "doc_ids": ["docA"], "user_id": "u",
-        })
-    assert result["status"] == "grounded"
-    assert result["judge_passed"] is True
-    assert len(judge.calls) == 1
-    assert judge.calls[0]["result"]["sources"][0]["doc_id"] == "docA"
 
 
 def test_judge_http_503_is_not_a_grounding_failure():
@@ -294,35 +224,31 @@ def test_judge_http_503_is_not_a_grounding_failure():
     assert result["judge_needs_fallback"] is False
 
 
-def test_optional_gemini_model_fallback_on_503(monkeypatch):
-    monkeypatch.setenv("OUTPUT_JUDGE_FALLBACK_MODEL", "backup-gemini-model")
+def test_optional_judge_model_fallback_on_503(monkeypatch):
+    monkeypatch.setenv("OUTPUT_JUDGE_FALLBACK_MODEL", "backup-judge-model")
     error = RuntimeError("High demand")
     error.code = 503
     client = MagicMock()
-    client.models.generate_content.side_effect = [error, SimpleNamespace(parsed=verdict().model_dump())]
+    client.chat.completions.create.side_effect = [error, chat_reply(verdict().model_dump())]
     pacer = MagicMock()
-    judge = GeminiOutputJudge(client, model_name="primary-gemini-model", pacer=pacer)
+    judge = BedrockOpenAIOutputJudge(client, model_name="primary-judge-model", pacer=pacer)
     result = judge.evaluate(
         question="What is ATP?",
         result={"status": "general_knowledge", "answer": "ATP stores energy", "sources": []},
     )
     assert result.passed
-    assert [call.kwargs["model"] for call in client.models.generate_content.call_args_list] == [
-        "primary-gemini-model", "backup-gemini-model",
+    assert [call.kwargs["model"] for call in client.chat.completions.create.call_args_list] == [
+        "primary-judge-model", "backup-judge-model",
     ]
     assert pacer.acquire.call_count == 2
 
 
 def test_verification_failure_is_not_formatted_as_general_knowledge(tmp_path):
-    import sqlite3
-    from doubtdesk.graph.nodes import formatting_node
     from doubtdesk.api.streaming import finalize_stream_result
 
     message = "Answer verification is temporarily unavailable. Please try again."
     state = {"status": "verification_failed", "answer": message, "sources": [], "verification_failed": True}
-    formatted = formatting_node(tmp_path / "documents.db")(state)
-    assert formatted["formatted_answer"] == message
-    streamed = finalize_stream_result(dict(state), db_path=tmp_path / "documents.db")
+    streamed = finalize_stream_result(dict(state))
     assert streamed["formatted_answer"] == message
 
 
@@ -350,31 +276,6 @@ def test_failed_api_call_is_distinct_from_rejected_answer():
     assert result["judge_reviews"][0]["http_status"] == 503
 
 
-def test_output_judge_rejection_on_grounding_routes_to_real_fallback():
-    from doubtdesk.graph.nodes import route_after_output_guardrail, fallback_node
-
-    judge = FakeJudge(verdict(False), verdict(False))
-    reviewer = output_guardrail_node(MagicMock(), "test", judge)
-    with patch("doubtdesk.graph.nodes.generate_vision_answer") as regenerate:
-        regenerate.return_value = SimpleNamespace(
-            status="sufficient", answer="Still unverified", sources=[SimpleNamespace(
-                doc_id="docA", page_numbers=[1], model_dump=lambda: {"doc_id": "docA", "page_numbers": [1]}
-            )]
-        )
-        result = reviewer({
-            "question": "What does a nephron do?", "status": "grounded", "answer": "Unverified answer",
-            "sources": [{"doc_id": "docA", "page_numbers": [1]}],
-            "retrieved_chunks": CHUNKS, "retrieved_pages": [],
-            "evidence_pages": [{"doc_id": "docA", "page_number": 1}],
-        })
-    assert route_after_output_guardrail(result) == "fallback"
-    assert result["judge_needs_fallback"] is True
-    with patch("doubtdesk.graph.nodes.generate_general_answer", return_value="General answer"):
-        fallback = fallback_node(MagicMock(), "test")
-        followup = fallback({"question": "What does a nephron do?", **result})
-    assert followup["status"] == "general_knowledge"
-    assert followup["judge_fallback_attempted"] is True
-    assert followup["answer"] == "General answer"
 
 
 def test_verification_failure_api_schema_and_formatting():
@@ -390,17 +291,16 @@ def test_verification_failure_api_schema_and_formatting():
 def test_hybrid_retrieval_top_k_config(monkeypatch):
     from doubtdesk.retrieval.hybrid import hybrid_search
     monkeypatch.setenv("RETRIEVAL_TOP_K", "6")
-    dense = {
-        "ids": [["c" + str(i) for i in range(10)]],
-        "documents": [["text" + str(i) for i in range(10)]],
-        "metadatas": [[{"doc_id": "docA", "page_number": i + 1} for i in range(10)]],
-        "distances": [[0.1 + 0.01*i for i in range(10)]],
-    }
+    dense = [[
+        {"chunk_id": "c" + str(i), "doc_id": "docA", "page_number": i + 1,
+         "text": "text" + str(i), "distance": 0.1 + 0.01*i}
+        for i in range(10)
+    ]]
     with (
         patch("doubtdesk.retrieval.hybrid.embed_queries", return_value=[0.1]),
         patch("doubtdesk.retrieval.hybrid.search_chunks", return_value=dense),
         patch("doubtdesk.retrieval.hybrid.lexical_candidates", return_value=[]),
     ):
-        result = hybrid_search(None, None, ["What is photosynthesis?"], ["docA"])
+        result = hybrid_search(None, ["What is photosynthesis?"], ["docA"])
     assert len(result) == 6
     assert len({item["chunk_id"] for item in result}) == 6

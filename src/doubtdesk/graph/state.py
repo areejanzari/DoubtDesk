@@ -9,6 +9,8 @@ class DoubtDeskState(TypedDict, total=False):
     retrieved_pages: list[dict]
     retrieved_chunks: list[dict]
     retrieval_candidate_count: int
+    retrieval_top_score: float | None
+    evidence_reason: str
     evidence_pages: list[dict]
     evidence_mode: str
     evidence_assessment: object

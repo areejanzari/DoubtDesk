@@ -45,10 +45,36 @@ class DocumentInfo(BaseModel):
     doc_id: str
     filename: str
     page_count: int
+    unreadable_pages: int = 0
+
+
+class DocumentStatus(BaseModel):
+    doc_id: str
+    status: Literal["pending", "processing", "completed", "failed"]
+    page_count: int
+    unreadable_pages: int = 0
 
 
 class UploadResponse(BaseModel):
     doc_id: str
-    status: Literal["completed", "cached"]
+    status: Literal["completed", "cached", "processing"]
     page_count: int
     filename: str
+
+
+PlanName = Literal["free", "pro", "unlimited"]
+
+
+class PlanUpdate(BaseModel):
+    plan: PlanName
+
+
+class UsageResponse(BaseModel):
+    plan: PlanName
+    questions_used: int
+    questions_limit: int | None
+    tokens_used: int
+    tokens_limit: int | None
+    in_flight: int
+    max_concurrent: int | None
+    window_resets_at: int | None

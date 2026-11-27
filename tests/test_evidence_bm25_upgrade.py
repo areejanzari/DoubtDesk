@@ -1,12 +1,11 @@
 from types import SimpleNamespace
-import sqlite3
 
+import numpy as np
+
+from doubtdesk.db import EMBEDDING_DIMENSIONS
 from doubtdesk.ingestion.schemas import ChunkRecord
-from doubtdesk.retrieval.lexical_store import (
-    replace_document_chunks,
-    lexical_candidates,
-    backfill_missing_documents,
-)
+from doubtdesk.retrieval.lexical_store import lexical_candidates
+from doubtdesk.retrieval.vector_store import replace_document_chunks as store_document_chunks
 from doubtdesk.answering.evidence_selection import (
     TextEvidenceAssessment,
     EvidencePage,
@@ -19,54 +18,41 @@ def chunk(doc, page, index, text):
     return ChunkRecord(doc_id=doc, page_number=page, chunk_index=index, text=text)
 
 
-def test_bm25_is_persisted_and_document_scoped(tmp_path):
-    db = tmp_path / "lexical.db"
+def replace_document_chunks(doc_id, chunks):
+    store_document_chunks(doc_id, chunks, np.ones((len(chunks), EMBEDDING_DIMENSIONS)))
+
+
+def test_bm25_is_persisted_and_document_scoped():
     replace_document_chunks("biology", [
         chunk("biology", 2, 0, "Photosynthesis needs sunlight and chlorophyll"),
         chunk("biology", 3, 0, "Roots absorb water"),
-    ], db)
+    ])
     replace_document_chunks("physics", [
         chunk("physics", 1, 0, "Sunlight transfers thermal energy"),
-    ], db)
-    results = lexical_candidates(["What does photosynthesis need?"], ["biology"], db_path=db)
+    ])
+    results = lexical_candidates(["What does photosynthesis need?"], ["biology"])
     assert results[0][0]["chunk_id"] == "biology_p2_c0"
     assert all(item["doc_id"] == "biology" for item in results[0])
-    assert lexical_candidates(["sunlight"], ["physics"], db_path=db)[0][0]["chunk_id"] == "physics_p1_c0"
+    assert lexical_candidates(["sunlight"], ["physics"])[0][0]["chunk_id"] == "physics_p1_c0"
 
 
-def test_replacing_document_removes_stale_chunks(tmp_path):
-    db = tmp_path / "lexical.db"
-    replace_document_chunks("d", [chunk("d", 1, 0, "old photosynthesis definition")], db)
-    replace_document_chunks("d", [chunk("d", 2, 0, "new respiration definition")], db)
-    assert not lexical_candidates(["photosynthesis"], ["d"], db_path=db)[0]
-    assert lexical_candidates(["respiration"], ["d"], db_path=db)[0][0]["page_number"] == 2
+def test_replacing_document_removes_stale_chunks():
+    replace_document_chunks("d", [chunk("d", 1, 0, "old photosynthesis definition")])
+    replace_document_chunks("d", [chunk("d", 2, 0, "new respiration definition")])
+    assert not lexical_candidates(["photosynthesis"], ["d"])[0]
+    assert lexical_candidates(["respiration"], ["d"])[0][0]["page_number"] == 2
 
 
-def test_backfill_existing_document_only_once(tmp_path):
-    docs = tmp_path / "documents.db"
-    lexical = tmp_path / "lexical.db"
-    with sqlite3.connect(docs) as conn:
-        conn.execute("CREATE TABLE documents (doc_id TEXT, status TEXT)")
-        conn.execute("INSERT INTO documents VALUES ('doc1', 'completed')")
-
-    class Collection:
-        calls = 0
-
-        def get(self, **kwargs):
-            self.calls += 1
-            if kwargs["offset"]:
-                return {"ids": [], "documents": [], "metadatas": []}
-            return {
-                "ids": ["doc1_p1_c0"],
-                "documents": ["The heart pumps blood"],
-                "metadatas": [{"doc_id": "doc1", "page_number": 1, "chunk_index": 0}],
-            }
-
-    collection = Collection()
-    assert backfill_missing_documents(collection, docs, lexical) == 1
-    assert backfill_missing_documents(collection, docs, lexical) == 0
-    assert collection.calls == 2
-    assert lexical_candidates(["heart"], ["doc1"], db_path=lexical)[0][0]["chunk_id"] == "doc1_p1_c0"
+def test_rare_terms_outrank_repeated_common_terms():
+    replace_document_chunks("bio", [
+        chunk("bio", 1, 0, "cycle cycle cycle"),
+        chunk("bio", 2, 0, "enzymes of the krebs pathway"),
+        chunk("bio", 3, 0, "cycle of water"),
+        chunk("bio", 4, 0, "cycle of rocks"),
+    ])
+    ranked = lexical_candidates(["krebs cycle"], ["bio"])[0]
+    assert ranked[0]["chunk_id"] == "bio_p2_c0"
+    assert len(ranked) == 4
 
 
 def test_text_sufficient_uses_no_images():

@@ -11,13 +11,19 @@ class RequestPacer:
         self._next = 0.0
         self._lock = threading.Lock()
 
-    def acquire(self):
+    def _reserve(self) -> float:
         with self._lock:
             now = monotonic()
             slot = max(now, self._next)
             self._next = slot + self.interval
-        if slot > now:
-            sleep(slot - now)
+        return slot - now
+
+    def acquire(self):
+        wait = self._reserve()
+        if wait > 0:
+            sleep(wait)
 
     async def acquire_async(self):
-        await asyncio.to_thread(self.acquire)
+        wait = self._reserve()
+        if wait > 0:
+            await asyncio.sleep(wait)

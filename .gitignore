@@ -45,3 +45,6 @@ frontend/playwright-report/
 *.tsbuildinfo
 *.backup_*
 *.bak-*
+/.claude
+/docs
+/.ruff_cache

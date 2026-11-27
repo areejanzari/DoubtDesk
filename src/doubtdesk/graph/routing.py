@@ -10,14 +10,6 @@ def route_documents(
 
     return "fallback"
 
-def route_evidence(
-    state: DoubtDeskState,
-) -> Literal["grounded", "fallback"]:
-    if state["evidence"].status == "sufficient":
-        return "grounded"
-
-    return "fallback"
-
 def route_retrieval(
     state: DoubtDeskState,
 ) -> Literal["evidence", "fallback"]:

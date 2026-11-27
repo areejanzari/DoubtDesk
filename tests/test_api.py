@@ -1,5 +1,3 @@
-import sqlite3
-from contextlib import closing
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -12,11 +10,12 @@ from doubtdesk.api.main import app
 from doubtdesk.auth.dependencies import require_current_user
 from doubtdesk.ingestion.registry import (
     attach_document_to_user,
-    initialize_registry,
     register_document,
     update_document_status,
 )
-from doubtdesk.memory.store import initialize_memory_db
+from psycopg.types.json import Jsonb
+
+from doubtdesk.db import connection
 
 
 @pytest.fixture
@@ -28,12 +27,9 @@ def account():
 def client(tmp_path, monkeypatch, account):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir()
-    initialize_registry(tmp_path / "data/documents.db")
-    initialize_memory_db(tmp_path / "data/conversations.db")
 
     app.state.graph = MagicMock()
     app.state.embedding_model = MagicMock()
-    app.state.collection = MagicMock()
 
     previous_overrides = app.dependency_overrides.copy()
     app.dependency_overrides[require_current_user] = lambda: account
@@ -49,11 +45,10 @@ def client(tmp_path, monkeypatch, account):
 
 def add_completed_document(tmp_path, filename="biology.pdf", owners=("user_A",)):
     doc_id = str(uuid4())
-    db_path = tmp_path / "data/documents.db"
-    register_document(doc_id, filename, f"hash_{doc_id}", db_path)
-    update_document_status(doc_id, "completed", 2, db_path)
+    register_document(doc_id, filename, f"hash_{doc_id}")
+    update_document_status(doc_id, "completed", 2)
     for owner in owners:
-        attach_document_to_user(owner, doc_id, filename, db_path)
+        attach_document_to_user(owner, doc_id, filename)
     return doc_id
 
 
@@ -104,13 +99,13 @@ def test_ask_without_documents(client):
     assert state["doc_ids"] == []
     assert state["conversation_id"] == response.json()["conversation_id"]
 
-    with closing(sqlite3.connect("data/conversations.db")) as conn:
+    with connection() as conn:
         row = conn.execute(
-            "SELECT user_id FROM conversations WHERE conversation_id = ?",
+            "SELECT user_id FROM conversations WHERE conversation_id = %s",
             (state["conversation_id"],),
         ).fetchone()
         saved = conn.execute(
-            "SELECT question FROM exchanges WHERE conversation_id = ?",
+            "SELECT question FROM exchanges WHERE conversation_id = %s",
             (state["conversation_id"],),
         ).fetchone()
 
@@ -189,13 +184,13 @@ def test_conversation_followup_and_cross_user_denial(client, account):
 
 def test_legacy_conversation_cannot_be_claimed(client):
     conversation_id = str(uuid4())
-    with closing(sqlite3.connect("data/conversations.db")) as conn, conn:
+    with connection() as conn:
         conn.execute(
             """
             INSERT INTO exchanges (conversation_id, question, answer, doc_ids, status)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (conversation_id, "Legacy question", "Legacy answer", "[]", "general_knowledge"),
+            (conversation_id, "Legacy question", "Legacy answer", Jsonb([]), "general_knowledge"),
         )
 
     response = client.post(
@@ -259,31 +254,64 @@ def test_reject_bad_pdf(client, filename, data, mime, detail):
     assert response.json()["detail"] == detail
 
 
-def test_successful_pdf_upload(client):
+def test_successful_pdf_upload_queues_background_ingestion(client):
     with pymupdf.open() as pdf:
         pdf.new_page()
         pdf_bytes = pdf.tobytes()
 
     doc_id = str(uuid4())
-    with patch(
-        "doubtdesk.api.routes.process_pdf",
-        return_value={"doc_id": doc_id, "status": "completed", "page_count": 1},
-    ) as mock_process:
+    with (
+        patch(
+            "doubtdesk.api.routes.start_ingestion",
+            return_value={"doc_id": doc_id, "status": "processing", "page_count": 0, "queued": True},
+        ) as mock_start,
+        patch("doubtdesk.api.routes.submit_ingestion") as mock_submit,
+    ):
+        response = client.post(
+            "/documents/upload",
+            files={"file": ("biology.pdf", pdf_bytes, "application/pdf")},
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "doc_id": doc_id,
+        "status": "processing",
+        "page_count": 0,
+        "filename": "biology.pdf",
+    }
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["user_id"] == "user_A"
+    assert mock_start.call_args.kwargs["filename"] == "biology.pdf"
+    stored = mock_start.call_args.args[0]
+    assert stored.suffix == ".pdf" and stored.read_bytes() == pdf_bytes
+    function, queued_doc_id, queued_path, _ = mock_submit.call_args.args
+    assert function.__name__ == "run_ingestion"
+    assert queued_doc_id == doc_id and queued_path == stored
+    stored.unlink()
+
+
+def test_cached_pdf_upload_returns_immediately(client):
+    with pymupdf.open() as pdf:
+        pdf.new_page()
+        pdf_bytes = pdf.tobytes()
+
+    doc_id = str(uuid4())
+    with (
+        patch(
+            "doubtdesk.api.routes.start_ingestion",
+            return_value={"doc_id": doc_id, "status": "cached", "page_count": 1, "queued": False},
+        ) as mock_start,
+        patch("doubtdesk.api.routes.submit_ingestion") as mock_submit,
+    ):
         response = client.post(
             "/documents/upload",
             files={"file": ("biology.pdf", pdf_bytes, "application/pdf")},
         )
 
     assert response.status_code == 200
-    assert response.json() == {
-        "doc_id": doc_id,
-        "status": "completed",
-        "page_count": 1,
-        "filename": "biology.pdf",
-    }
-    mock_process.assert_called_once()
-    assert mock_process.call_args.kwargs["user_id"] == "user_A"
-    assert mock_process.call_args.args[0].name == "biology.pdf"
+    assert response.json()["status"] == "cached"
+    mock_submit.assert_not_called()
+    assert not mock_start.call_args.args[0].exists()
 
 
 def test_invalid_document_id(client):

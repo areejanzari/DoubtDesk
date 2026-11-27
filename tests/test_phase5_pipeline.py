@@ -11,18 +11,16 @@ def test_off_topic_emits_exact_answer():
 
 
 def test_empty_automatic_chat_cleanup_preserves_nonempty_and_renamed(tmp_path):
-    from doubtdesk.memory.store import initialize_memory_db, claim_or_check_conversation, delete_empty_conversation, list_user_conversations, save_exchange, rename_user_conversation
-    db = tmp_path / 'history.db'
-    initialize_memory_db(db)
+    from doubtdesk.memory.store import claim_or_check_conversation, delete_empty_conversation, list_user_conversations, save_exchange, rename_user_conversation
     for chat in ('empty', 'saved', 'renamed', 'other'):
-        assert claim_or_check_conversation(chat, 'other' if chat == 'other' else 'user', db_path=db)
-    save_exchange(conversation_id='saved', question='q', answer='a', doc_ids=[], status='general_knowledge', user_id='user', db_path=db)
-    rename_user_conversation('renamed', 'user', 'Keep this', db_path=db)
-    assert delete_empty_conversation('empty', 'user', db_path=db)
-    assert not delete_empty_conversation('saved', 'user', db_path=db)
-    assert not delete_empty_conversation('renamed', 'user', db_path=db)
-    assert not delete_empty_conversation('other', 'user', db_path=db)
-    assert {row['conversation_id'] for row in list_user_conversations('user', db_path=db)} == {'saved', 'renamed'}
+        assert claim_or_check_conversation(chat, 'other' if chat == 'other' else 'user')
+    save_exchange(conversation_id='saved', question='q', answer='a', doc_ids=[], status='general_knowledge', user_id='user')
+    rename_user_conversation('renamed', 'user', 'Keep this')
+    assert delete_empty_conversation('empty', 'user')
+    assert not delete_empty_conversation('saved', 'user')
+    assert not delete_empty_conversation('renamed', 'user')
+    assert not delete_empty_conversation('other', 'user')
+    assert {row['conversation_id'] for row in list_user_conversations('user')} == {'saved', 'renamed'}
 
 
 def test_shared_nonstream_runner_calls_same_answer_generator(monkeypatch):
@@ -53,15 +51,13 @@ def test_both_http_routes_share_answer_behavior(scenario, tmp_path, monkeypatch)
     from doubtdesk.api import routes, streaming
     from doubtdesk.auth.dependencies import require_current_user
     from doubtdesk.answering.output_guardrails import JudgeVerdict
-    from doubtdesk.ingestion.registry import initialize_registry, register_document, update_document_status, attach_document_to_user
+    from doubtdesk.ingestion.registry import register_document, update_document_status, attach_document_to_user
     monkeypatch.chdir(tmp_path)
     (tmp_path / 'data').mkdir()
-    db = tmp_path / 'data/documents.db'
-    initialize_registry(db)
     doc = str(uuid4())
-    register_document(doc, 'private.pdf', 'hash', db)
-    update_document_status(doc, 'completed', 1, db)
-    attach_document_to_user('u', doc, 'own.pdf', db)
+    register_document(doc, 'private.pdf', 'hash')
+    update_document_status(doc, 'completed', 1)
+    attach_document_to_user('u', doc, 'own.pdf')
     monkeypatch.setattr(routes, 'claim_or_check_conversation', lambda **kw: True)
     monkeypatch.setattr(routes, '_save_exchange_and_memory', Mock())
     monkeypatch.setattr(routes, 'graph_config', lambda: None)
@@ -104,6 +100,8 @@ def test_both_http_routes_share_answer_behavior(scenario, tmp_path, monkeypatch)
     blocks=[block.split('\ndata: ',1) for block in streamed.text.split('\n\n') if '\ndata: ' in block]
     final=next(json.loads(data) for event,data in blocks if event=='event: complete')
     assert final==normal.json()
-    assert ''.join(json.loads(data)['text'] for event,data in blocks if event=='event: token')==final['answer']
+    last_reset=max((i for i,(event,_) in enumerate(blocks) if event=='event: reset'),default=-1)
+    assert ''.join(json.loads(data)['text'] for event,data in blocks[last_reset+1:] if event=='event: token')==final['answer']
+    assert (last_reset >= 0) == (scenario in ('repair','fallback','fallback-error','unavailable'))
     assert final['status']== {'grounded':'grounded','insufficient':'general_knowledge','document-specific':'general_knowledge','repair':'grounded','fallback':'general_knowledge','fallback-error':'verification_failed','unavailable':'verification_failed'}[scenario]
     if final['status']=='grounded': assert 'own.pdf' in final['formatted_answer'] and 'private.pdf' not in final['formatted_answer']

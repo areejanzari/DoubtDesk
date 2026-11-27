@@ -35,10 +35,39 @@ class _ContextIterator:
                 await anyio.to_thread.run_sync(self.context.run, close)
 
 
+class _AsyncIterator:
+    def __init__(self, content):
+        self.iterator = content
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.closed:
+            raise StopAsyncIteration
+        try:
+            return await self.iterator.__anext__()
+        except StopAsyncIteration:
+            self.closed = True
+            raise
+
+    async def aclose(self):
+        if self.closed:
+            return
+        self.closed = True
+        close = getattr(self.iterator, "aclose", None)
+        if close is not None:
+            await close()
+
+
 class ContextStreamingResponse(StreamingResponse):
     def __init__(self, content, *, on_close=None, **kwargs):
         self.on_close = on_close
-        self.context_iterator = _ContextIterator(content)
+        if hasattr(content, "__aiter__"):
+            self.context_iterator = _AsyncIterator(content.__aiter__())
+        else:
+            self.context_iterator = _ContextIterator(content)
         super().__init__(self.context_iterator, **kwargs)
 
     async def stream_response(self, send):
